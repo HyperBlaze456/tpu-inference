@@ -3,12 +3,20 @@ import os
 
 import flax.linen as nn
 import jax
+# QWIX imports
+import qwix
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from qwix import Filter  # For applying filters to parameters
+from qwix import (
+    QuantConfig,  # For quantization configs
+    QuantizationWeightConfig)
 from transformers import PretrainedConfig
 from vllm.config import VllmConfig
 
 from tpu_commons.models.jax.utils.param_overview import get_parameter_overview
+
+#
 
 
 def _get_model_architecture(config: PretrainedConfig) -> nn.Module:
@@ -48,6 +56,32 @@ def get_nn_model(
         mesh=mesh,
     )
     params = model.load_weights(vllm_config.model_config.model)
+
+    # --- START Qwix Quantization Logic ---
+
+    qwix_quant_config = QuantConfig(
+        weight_quant_config=QuantizationWeightConfig(
+            num_bits=4,
+            quant_axis=(
+                0, 1
+            ),  # Standard for linear layer weights (e.g., input_dim, output_dim)
+            per_channel=False,  # Per-tensor quantization for simplicity
+        )
+        # You can add activation_quant_config, bias_quant_config etc. if needed
+    )
+
+    # Define a filter to apply quantization to all relevant modules (e.g., linear layers).
+    qwix_quant_filter = Filter.with_all_rules()
+
+    print(
+        f"[Qwix] Applying Qwix quantization with config: {qwix_quant_config}")
+    # Apply quantization to the loaded model parameters (a JAX pytree)
+    # quantize_model_ptq is the high-level function in qwix.ptq
+    params = qwix.quantize_model_ptq(params, qwix_quant_config,
+                                     qwix_quant_filter)
+    print("[Qwix] Qwix quantization applied to model parameters successfully.")
+    # --- END Qwix Quantization Logic ---
+
     if os.getenv("INSPECT_MODEL", False):
         print(
             "Model params:\n%s",
