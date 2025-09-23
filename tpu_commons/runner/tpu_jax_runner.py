@@ -635,12 +635,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             total_num_scheduled_tokens:padded_total_num_scheduled_tokens] = 0
 
         # Please see runner_utils.PhasedBasedProfiler for details
-        if self.phase_based_profiler:
-            batch_composition_stats = runner_utils.get_batch_composition_stats(
-                self.input_batch, total_num_scheduled_tokens, num_reqs,
-                padded_total_num_scheduled_tokens, scheduler_output)
+        # if self.phase_based_profiler:
+        # batch_composition_stats = runner_utils.get_batch_composition_stats(
+        #     self.input_batch, total_num_scheduled_tokens, num_reqs,
+        #     padded_total_num_scheduled_tokens, scheduler_output)
 
-            self.phase_based_profiler.step(batch_composition_stats)
+        #    self.phase_based_profiler.step(batch_composition_stats)
 
         # Inputs
         input_ids = self.input_ids_cpu[:padded_total_num_scheduled_tokens]

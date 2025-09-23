@@ -786,32 +786,32 @@ def _ragged_paged_attention_kernel(
 
                 # Flash attention with cur bkv and bq
                 # NOTE: kv_packing is divided by 2 because k and v are packed together.
-                heads_per_load = max(1, kv_packing // 2)
-                for kv_head_start in range(0, actual_num_kv_heads,
-                                           heads_per_load):
-                    bkv_lst = strided_load_bkv(
-                        bkv_sem_idx,
-                        kv_head_start * 2,
-                        num_kv_heads_x2,
-                        bkv_bitmask=bkv_bitmask,
-                    )
-                    assert len(bkv_lst) == heads_per_load
-                    for i in range(heads_per_load):
-                        kv_head_idx = kv_head_start + i
-                        if kv_head_idx >= actual_num_kv_heads:
-                            break
-                        bq = load_bq(bq_sem_idx,
-                                     kv_head_idx,
-                                     actual_bq_sz=actual_bq_sz)
-                        bk, bv = bkv_lst[i]
-                        flash_attention(
-                            bq,
-                            bk,
-                            bv,
-                            bq_idx=bq_idx,
-                            bkv_idx=bkv_idx,
-                            kv_head_idx=kv_head_idx,
-                        )
+                # heads_per_load = max(1, kv_packing // 2)
+                # for kv_head_start in range(0, actual_num_kv_heads,
+                #                            heads_per_load):
+                #     bkv_lst = strided_load_bkv(
+                #         bkv_sem_idx,
+                #         kv_head_start * 2,
+                #         num_kv_heads_x2,
+                #         bkv_bitmask=bkv_bitmask,
+                #     )
+                #     assert len(bkv_lst) == heads_per_load
+                #     for i in range(heads_per_load):
+                #         kv_head_idx = kv_head_start + i
+                #         if kv_head_idx >= actual_num_kv_heads:
+                #             break
+                #         bq = load_bq(bq_sem_idx,
+                #                      kv_head_idx,
+                #                      actual_bq_sz=actual_bq_sz)
+                #         bk, bv = bkv_lst[i]
+                #         flash_attention(
+                #             bq,
+                #             bk,
+                #             bv,
+                #             bq_idx=bq_idx,
+                #             bkv_idx=bkv_idx,
+                #             kv_head_idx=kv_head_idx,
+                #         )
 
             lax.fori_loop(0, num_bkv, compute_with_bkv, None, unroll=False)
 
@@ -1339,7 +1339,7 @@ def ragged_paged_attention(
                 bkv_sz,
                 q.dtype,
                 kv_cache.dtype,
-            ) * 2.4)  # TODO(jevinjiang): figure out why it is so inaccurate?
+            ) * 3)  # TODO(jevinjiang): figure out why it is so inaccurate?
     grid = (distribution[2], )
 
     in_specs = [
