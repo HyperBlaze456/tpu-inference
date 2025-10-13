@@ -114,7 +114,7 @@ class LatencyTracker:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.end_time = time.perf_counter()
         elapsed_time = self.end_time - self.start_time
-        logger.debug(f"Latency for '{self.name}': {elapsed_time:.3f} seconds")
+        logger.warning(f"Latency for '{self.name}': {elapsed_time:.3f} seconds")
 
 
 class ForbidCompile:

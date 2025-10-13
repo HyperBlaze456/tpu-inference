@@ -337,16 +337,16 @@ class KVCacheManager:
         """
         if block_ids == list(range(block_ids[0],
                                    block_ids[0] + len(block_ids))):
-            with runner_utils.LatencyTracker(
-                    "BatchedGatherKVSlices-for-blocks"):
-                batched_kv_cache_per_layer = self._jitted_gather_continuous_kv_cache(
-                    self.runner.kv_caches, block_ids[0], len(block_ids))
+            # with runner_utils.LatencyTracker(
+            #         "BatchedGatherKVSlices-for-blocks"):
+            batched_kv_cache_per_layer = self._jitted_gather_continuous_kv_cache(
+                self.runner.kv_caches, block_ids[0], len(block_ids))
 
         else:
-            with runner_utils.LatencyTracker(
-                    "BatchedGatherKVSlices-for-blocks"):
-                batched_kv_cache_per_layer = self._jitted_gather_kv_cache(
-                    self.runner.kv_caches, jnp.array(block_ids))
+            # with runner_utils.LatencyTracker(
+            #         "BatchedGatherKVSlices-for-blocks"):
+            batched_kv_cache_per_layer = self._jitted_gather_kv_cache(
+                self.runner.kv_caches, jnp.array(block_ids))
         return batched_kv_cache_per_layer
 
     def transfer_kv_cache(self,
@@ -412,26 +412,26 @@ class KVCacheManager:
                       block_numbers[0] + len(block_numbers))):
             # For continuous blocks we use slice instead of scatter.
             start_block = block_numbers[0]
-            with runner_utils.LatencyTracker(
-                    f"JittedInsertContinuousKVCache-b{len(block_numbers)}"):
-                logger.debug(f"inserting to continuous blocks {block_numbers}")
-                self.runner.kv_caches = KVCacheManager._jitted_insert_continuous_kv_cache(
-                    self.runner.block_size,
-                    self.runner.kv_caches,
-                    kv_cache_slices,
-                    start_block,
-                )
+            # with runner_utils.LatencyTracker(
+            #         f"JittedInsertContinuousKVCache-b{len(block_numbers)}"):
+            #     logger.debug(f"inserting to continuous blocks {block_numbers}")
+            self.runner.kv_caches = KVCacheManager._jitted_insert_continuous_kv_cache(
+                self.runner.block_size,
+                self.runner.kv_caches,
+                kv_cache_slices,
+                start_block,
+            )
         else:
-            with runner_utils.LatencyTracker(
-                    f"JittedInsertKVCache-b{len(block_numbers)}"):
-                logger.debug(
-                    f"inserting to non continuous blocks {block_numbers}")
-                self.runner.kv_caches = KVCacheManager._jitted_insert_kv_cache(
-                    self.runner.block_size,
-                    self.runner.kv_caches,
-                    kv_cache_slices,
-                    jnp.array(block_numbers),
-                )
+            # with runner_utils.LatencyTracker(
+            #         f"JittedInsertKVCache-b{len(block_numbers)}"):
+            #     logger.debug(
+            #         f"inserting to non continuous blocks {block_numbers}")
+            self.runner.kv_caches = KVCacheManager._jitted_insert_kv_cache(
+                self.runner.block_size,
+                self.runner.kv_caches,
+                kv_cache_slices,
+                jnp.array(block_numbers),
+            )
 
         logger.debug(
             f"Updated kv cache entries cnt={len(self.runner.kv_caches)}")
