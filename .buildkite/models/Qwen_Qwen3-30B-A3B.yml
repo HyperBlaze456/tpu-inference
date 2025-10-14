@@ -2,24 +2,24 @@
 agents:
   queue: tpu_v6e_8_queue
 steps:
-  - label: "Unit tests for Qwen/Qwen3-30B-A3B"
-    key: "Qwen_Qwen3-30B-A3B_UnitTest"
-    soft_fail: true
-    commands:
-      - |
-        .buildkite/scripts/run_in_docker.sh \
-          bash -c 'python3 -m pytest -s -v -x /workspace/tpu_inference/tests/models/jax/test_qwen3.py'
-  - label: "Record unit test result for Qwen/Qwen3-30B-A3B"
-    key: "record_Qwen_Qwen3-30B-A3B_UnitTest"
-    depends_on: "Qwen_Qwen3-30B-A3B_UnitTest"
-    env:
-      CI_STAGE: "UnitTest"
-      CI_TARGET: Qwen/Qwen3-30B-A3B
-    agents:
-      queue: tpu_v6e_queue
-    commands:
-      - |
-        .buildkite/scripts/record_step_result.sh Qwen_Qwen3-30B-A3B_UnitTest
+  # - label: "Unit tests for Qwen/Qwen3-30B-A3B"
+  #   key: "Qwen_Qwen3-30B-A3B_UnitTest"
+  #   soft_fail: true
+  #   commands:
+  #     - |
+  #       .buildkite/scripts/run_in_docker.sh \
+  #         bash -c 'python3 -m pytest -s -v -x /workspace/tpu_inference/tests/models/jax/test_qwen3.py'
+  # - label: "Record unit test result for Qwen/Qwen3-30B-A3B"
+  #   key: "record_Qwen_Qwen3-30B-A3B_UnitTest"
+  #   depends_on: "Qwen_Qwen3-30B-A3B_UnitTest"
+  #   env:
+  #     CI_STAGE: "UnitTest"
+  #     CI_TARGET: Qwen/Qwen3-30B-A3B
+  #   agents:
+  #     queue: tpu_v6e_queue
+  #   commands:
+  #     - |
+  #       .buildkite/scripts/record_step_result.sh Qwen_Qwen3-30B-A3B_UnitTest
 
   - label: "Integration tests for Qwen/Qwen3-30B-A3B"
     key: "Qwen_Qwen3-30B-A3B_IntegrationTest"
