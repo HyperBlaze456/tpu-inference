@@ -1,4 +1,5 @@
 # meta-llama/Llama-3.3-70B-Instruct
+# text-only
 steps:
   - label: "Unit tests for meta-llama/Llama-3.3-70B-Instruct"
     key: "meta-llama_Llama-3_3-70B-Instruct_UnitTest"
