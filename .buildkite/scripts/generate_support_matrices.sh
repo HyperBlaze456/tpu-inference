@@ -11,8 +11,12 @@ FEATURE_LIST_KEY="feature-list"
 mapfile -t model_list < <(buildkite-agent meta-data get "${MODEL_LIST_KEY}" --default "")
 mapfile -t feature_list < <(buildkite-agent meta-data get "${FEATURE_LIST_KEY}" --default "")
 MODEL_STAGES=("UnitTest" "IntegrationTest" "Benchmark")
-FEATURE_STAGES=("CorrectnessTest" "PerformanceTest")
 MODEL_CATEGORY=("text-only" "multimodel")
+FEATURE_STAGES=("CorrectnessTest" "PerformanceTest")
+FEATURE_CATEGORY=("feature support matrix" "kernel support matrix" "quantization support matrix" "parallelism support matrix")
+
+model_csv_files=()
+feature_csv_files=()
 
 # Output CSV files
 model_support_matrix_csv="model_support_matrix.csv"
@@ -43,31 +47,23 @@ process_models_by_category() {
     done
 }
 
-process_models() {
-    for model in "$@"; do
-        row="\"$model\""
-        for stage in "${MODEL_STAGES[@]}"; do
-            result=$(buildkite-agent meta-data get "${model}:${stage}" --default "N/A")
-            row="$row,$result"
-            if [ "${result}" != "✅" ] && [ "${result}" != "N/A" ] ; then
-                ANY_FAILED=true
-            fi
-        done
-        echo "$row" >> "$model_support_matrix_csv"
-    done
-}
+process_features_by_category() {
+    local category="$1"
+    local csv_filename="$2"
 
-process_features() {
-    for feature in "$@"; do
+    echo "Feature,CorrectnessTest,PerformanceTest" > "$csv_filename"
+
+    for feature in "${feature_list[@]}"; do
         row="\"$feature\""
         for stage in "${FEATURE_STAGES[@]}"; do
-            result=$(buildkite-agent meta-data get "${feature}:${stage}" --default "N/A")
+            # Get result using the new feature:category:stage format
+            result=$(buildkite-agent meta-data get "${feature}:${category}:${stage}" --default "N/A")
             row="$row,$result"
             if [ "${result}" != "✅" ] && [ "${result}" != "N/A" ] ; then
                 ANY_FAILED=true
             fi
         done
-        echo "$row" >> "$feature_support_matrix_csv"
+        echo "$row" >> "$csv_filename"
     done
 }
 
@@ -86,21 +82,32 @@ if [ ${#model_list[@]} -gt 0 ]; then
     done
 fi
 
-if [ ${#model_list[@]} -gt 0 ]; then
-    process_models "${model_list[@]}"
-fi
-
 if [ ${#feature_list[@]} -gt 0 ]; then
-    process_features "${feature_list[@]}"
+    for category in "${FEATURE_CATEGORY[@]}"; do
+        # Sanitize filename (e.g., "feature support matrix" -> "feature_support_matrix")
+        category_filename=$(echo "$category" | tr ' ' '_')
+        csv_filename="${category_filename}.csv"
+
+        feature_csv_files+=("$csv_filename") # Add to list
+
+        echo "--- Generating matrix for feature category: $category ---"
+        process_features_by_category "$category" "$csv_filename"
+    done
 fi
 
 buildkite-agent meta-data set "CI_TESTS_FAILED" "${ANY_FAILED}"
 
-echo "--- Model support matrix ---"
-cat "$model_support_matrix_csv"
+echo "--- Model support matrices (categorized) ---"
+for csv_file in "${model_csv_files[@]}"; do
+    echo "--- Matrix: $csv_file ---"
+    cat "$csv_file"
+done
 
-echo "--- Feature support matrix ---"
-cat "$feature_support_matrix_csv"
+echo "--- Feature support matrices (categorized) ---"
+for csv_file in "${feature_csv_files[@]}"; do
+    echo "--- Matrix: $csv_file ---"
+    cat "$csv_file"
+done
 
 echo "--- Saving support matrices as Buildkite Artifacts ---"
 for csv_file in "${model_csv_files[@]}"; do
@@ -108,9 +115,13 @@ for csv_file in "${model_csv_files[@]}"; do
     buildkite-agent artifact upload "$csv_file"
 done
 
-#buildkite-agent artifact upload "$model_support_matrix_csv"
-buildkite-agent artifact upload "$feature_support_matrix_csv"
+for csv_file in "${feature_csv_files[@]}"; do
+    buildkite-agent artifact upload "$csv_file"
+done
+
 echo "Reports uploaded successfully."
 
 # cleanup
-rm "$model_support_matrix_csv" "$feature_support_matrix_csv"
+if [ ${#feature_csv_files[@]} -gt 0 ]; then
+    rm "${feature_csv_files[@]}"
+fi
