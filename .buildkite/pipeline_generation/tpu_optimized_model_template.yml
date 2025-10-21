@@ -12,8 +12,9 @@ steps:
     key: "record_{SANITIZED_MODEL_NAME}_UnitTest"
     depends_on: "{SANITIZED_MODEL_NAME}_UnitTest"
     env:
-      CI_STAGE: "UnitTest"
       CI_TARGET: {MODEL_NAME}
+      CI_STAGE: "UnitTest"
+      CI_CATEGORY: "{CATEGORY}"
     agents:
       queue: tpu_v6e_queue
     commands:
@@ -39,6 +40,7 @@ steps:
     env:
       CI_TARGET: {MODEL_NAME}
       CI_STAGE: "IntegrationTest"
+      CI_CATEGORY: "{CATEGORY}"
     agents:
       queue: tpu_v6e_queue
     commands:
@@ -64,6 +66,7 @@ steps:
     env:
       CI_TARGET: {MODEL_NAME}
       CI_STAGE: "Benchmark"
+      CI_CATEGORY: "{CATEGORY}"
     agents:
       queue: tpu_v6e_queue
     commands:
