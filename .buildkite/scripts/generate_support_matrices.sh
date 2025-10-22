@@ -23,7 +23,8 @@ process_models() {
         local category
         category=$(buildkite-agent meta-data get "${model}_category" --default "text-only")
         # Define the category-specific CSV filename
-        local category_csv="${category}_model_support_matrix.csv"
+        local category_filename=${category// /_}
+        local category_csv="${category_filename}_model_support_matrix.csv"
         if [ ! -f "$category_csv" ]; then
             echo "Model,UnitTest,IntegrationTest,Benchmark" > "$category_csv"
             model_csv_files+=("$category_csv")
@@ -48,7 +49,8 @@ process_features() {
         local category
         category=$(buildkite-agent meta-data get "${feature}_category" --default "feature support matrix")
         # Define the category-specific CSV filename
-        local category_csv="${category}_feature_support_matrix.csv"
+        local category_filename=${category// /_}
+        local category_csv="${category_filename}_feature_support_matrix.csv"
         if [ ! -f "$category_csv" ]; then
             echo "Feature,CorrectnessTest,PerformanceTest" > "$category_csv"
             feature_csv_files+=("$category_csv")
