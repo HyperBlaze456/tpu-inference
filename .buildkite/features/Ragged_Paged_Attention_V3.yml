@@ -1,4 +1,5 @@
 # Ragged Paged Attention V3
+# kernel support matrix
 steps:
   - label: "Correctness tests for Ragged Paged Attention V3"
     key: "Ragged_Paged_Attention_V3_CorrectnessTest"
@@ -13,6 +14,7 @@ steps:
     env:
       CI_TARGET: "Ragged Paged Attention V3"
       CI_STAGE: "CorrectnessTest"
+      CI_CATEGORY: "kernel support matrix"
     agents:
       queue: tpu_v6e_queue
     commands:
@@ -33,6 +35,7 @@ steps:
     env:
       CI_TARGET: "Ragged Paged Attention V3"
       CI_STAGE: "PerformanceTest"
+      CI_CATEGORY: "kernel support matrix"
     agents:
       queue: tpu_v6e_queue
     commands:

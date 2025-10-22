@@ -14,6 +14,7 @@ steps:
     env:
       CI_TARGET: "Quantized Matmul Attention and KV Cache"
       CI_STAGE: "CorrectnessTest"
+      CI_CATEGORY: "kernel support matrix"
     agents:
       queue: tpu_v6e_queue
     commands:
@@ -45,6 +46,7 @@ steps:
     env:
       CI_TARGET: "Quantized Matmul Attention and KV Cache"
       CI_STAGE: "PerformanceTest"
+      CI_CATEGORY: "kernel support matrix"
     agents:
       queue: tpu_v6e_queue
     commands:

@@ -5,6 +5,8 @@ TARGET_FOLDERS="models features"
 MODEL_LIST_KEY="model-list"
 FEATURE_LIST_KEY="feature-list"
 
+DEV_ALLOWED_TARGET=()
+
 declare -a pipeline_steps
 
 # Declare separate arrays for each list
@@ -51,7 +53,12 @@ for folder_path in $TARGET_FOLDERS; do
     queue: tpu_v6e_queue
 EOF
 )
-
+  if [[ ${#DEV_ALLOWED_TARGET[@]} -gt 0 ]]; then
+    if [[ ! " ${DEV_ALLOWED_TARGET[@]} " =~ " ${subject_name} " ]]; then
+      continue
+    fi
+  fi
+  
   pipeline_steps+=("${pipeline_yaml}")
 
   done < <(find "$folder" -maxdepth 1 -type f \( -name "*.yml" -o -name "*.yaml" \) -print0)

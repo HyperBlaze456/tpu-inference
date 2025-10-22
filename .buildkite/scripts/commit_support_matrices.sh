@@ -3,7 +3,7 @@ set -e
 
 # --- Configuration ---
 REPO_URL="https://github.com/vllm-project/tpu-inference.git"
-TARGET_BRANCH="origin/dev/add_model_feature_type"
+TARGET_BRANCH="${BUILDKITE_BRANCH}"
 
 # Conditional Configuration for Release vs. Nightly
 if [ "${NIGHTLY}" = "1" ]; then

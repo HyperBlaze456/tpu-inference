@@ -1,4 +1,5 @@
 # Single Program Multi Data
+# feature support matrix
 steps:
   - label: "Correctness tests for Single Program Multi Data"
     key: "Single_Program_Multi_Data__CorrectnessTest"
@@ -13,6 +14,7 @@ steps:
     env:
       CI_TARGET: "Single Program Multi Data"
       CI_STAGE: "CorrectnessTest"
+      CI_CATEGORY: "feature support matrix"
     agents:
       queue: tpu_v6e_queue
     commands:
@@ -33,6 +35,7 @@ steps:
     env:
       CI_TARGET: "Single Program Multi Data"
       CI_STAGE: "PerformanceTest"
+      CI_CATEGORY: "feature support matrix"
     agents:
       queue: tpu_v6e_queue
     commands:

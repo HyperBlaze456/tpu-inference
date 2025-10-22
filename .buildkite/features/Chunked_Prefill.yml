@@ -1,5 +1,5 @@
 # Chunked Prefill
-# kernel support matrix
+# feature support matrix
 steps:
   - label: "Correctness tests for Chunked Prefill"
     key: "Chunked_Prefill_CorrectnessTest"
@@ -7,14 +7,14 @@ steps:
     agents:
       queue: tpu_v6e_queue
     commands:
-      - echo "placeholder"  # TODO : replace with your correctness test command
+      - echo "default on in vLLM"
   - label: "Record correctness test result for Chunked Prefill"
     key: "record_Chunked_Prefill_CorrectnessTest"
     depends_on: "Chunked_Prefill_CorrectnessTest"
     env:
       CI_TARGET: "Chunked Prefill"
       CI_STAGE: "CorrectnessTest"
-      CI_CATEGORY: "kernel support matrix"
+      CI_CATEGORY: "feature support matrix"
     agents:
       queue: tpu_v6e_queue
     commands:
@@ -28,14 +28,14 @@ steps:
     agents:
       queue: tpu_v6e_queue
     commands:
-      - echo "placeholder"  # TODO : replace with your performance test command
-  - label: "Record performance test result for Chunked_Prefill"
+      - echo "default on in vLLM"
+  - label: "Record performance test result for Chunked Prefill"
     key: "record_Chunked_Prefill_PerformanceTest"
     depends_on: "Chunked_Prefill_PerformanceTest"
     env:
       CI_TARGET: "Chunked Prefill"
       CI_STAGE: "PerformanceTest"
-      CI_CATEGORY: "kernel support matrix"
+      CI_CATEGORY: "feature support matrix"
     agents:
       queue: tpu_v6e_queue
     commands:
