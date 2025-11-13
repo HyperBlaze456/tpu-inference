@@ -6,14 +6,13 @@ import ray
 import vllm.envs as envs
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.multimodal.inputs import MultiModalKwargs
 from vllm.platforms import current_platform
 from vllm.ray.ray_env import get_env_vars_to_copy
 from vllm.sequence import VLLM_TOKEN_ID_ARRAY_TYPE
-from vllm.utils.network_utils.network_utils import ((get_distributed_init_method, get_ip,
-                                     
-                                      get_open_port))
+from vllm.utils.network_utils import (get_distributed_init_method, get_ip,
+                                      get_open_port)
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.executor.ray_distributed_executor import \
     RayDistributedExecutor as RayDistributedExecutorV1
 from vllm.v1.executor.ray_executor import RayWorkerMetaData
@@ -72,21 +71,16 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
 
     def _init_executor(self) -> None:
         self.forward_dag: Optional[ray.dag.CompiledDAG] = None
-        # V1 uses SPMD worker and compiled DAG
-        os.environ["VLLM_USE_RAY_SPMD_WORKER"] = "1"
-        os.environ["VLLM_USE_RAY_COMPILED_DAG"] = "1"
+
         os.environ["VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE"] = "shm"
 
-        # If the env var is set, it uses the Ray's compiled DAG API
-        # which optimizes the control plane overhead.
-        # Run vLLM with VLLM_USE_RAY_COMPILED_DAG=1 to enable it.
         # Currently, this requires USE_RAY_SPMD_WORKER=True.
-        self.use_ray_compiled_dag = envs.VLLM_USE_RAY_COMPILED_DAG
-        # If the env var is set, then we do not distinguish between the
+        self.use_ray_compiled_dag = True
+        # If it is true, then we do not distinguish between the
         # "driver worker" vs other workers. Also, the rank 0 worker will
         # be executed in a remote Ray worker. Currently this requires
         # USE_RAY_COMPILED_DAG=True.
-        self.use_ray_spmd_worker = envs.VLLM_USE_RAY_SPMD_WORKER
+        self.use_ray_spmd_worker = True
 
         assert self.uses_ray
         self._initialize_ray_cluster()
@@ -103,16 +97,15 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         self.input_encoder = msgspec.msgpack.Encoder(enc_hook=_encode_hook)
         self.output_decoder = msgspec.msgpack.Decoder(
             Optional[List[SamplerOutput]])
-        self.use_v1 = envs.VLLM_USE_V1
 
         self.pp_locks: Optional[List[asyncio.Lock]] = None
 
+        self.scheduler_output: SchedulerOutput | None = None
+
         # KV connector setup
         self.has_connector = self.vllm_config.kv_transfer_config is not None
-        self.kv_output_aggregator = KVOutputAggregator(
-            self.parallel_config.world_size)
         if self.has_connector:
-            ip_port = self._run_workers("get_node_kv_ip_port")
+            ip_port = self.collective_rpc("get_node_kv_ip_port")
             for item in ip_port:
                 set_node_kv_ip_port(item)
 
@@ -235,7 +228,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         for each, ip in zip(worker_metadata, worker_ips):
             each.ip = ip
 
-        logger.debug("workers: %s", worker_metadata)
+        logger.debug(f"Initialized worker_metadata: {worker_metadata}")
 
         ip_counts: Dict[str, int] = {}
         for ip in worker_ips:
@@ -262,12 +255,15 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         start_rank = 0
         for i, item in enumerate(sorted_worker_metadata):
             item.adjusted_rank = i + start_rank
+        logger.info(
+            f"Initialized sorted worker_metadata: {sorted_worker_metadata}")
+
         self.workers = [item.worker for item in sorted_worker_metadata]
         rerank_mapping = {
             item.created_rank: item.adjusted_rank
             for item in sorted_worker_metadata
         }
-        self._run_workers("adjust_rank", rerank_mapping)
+        self.collective_rpc("adjust_rank", args=(rerank_mapping, ))
 
         # Get the set of TPU IDs used on each node.
         worker_node_and_tpu_ids = []
@@ -323,8 +319,8 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         self._env_vars_for_all_workers = (
             all_args_to_update_environment_variables)
 
-        self._run_workers("update_environment_variables",
-                          self._get_env_vars_to_be_updated())
+        self.collective_rpc("update_environment_variables",
+                            args=(self._get_env_vars_to_be_updated(), ))
 
         distributed_init_method = get_distributed_init_method(
             driver_ip, get_open_port())
@@ -342,12 +338,9 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                 or (rank % self.parallel_config.tensor_parallel_size == 0),
             )
             all_kwargs.append(kwargs)
-        self._run_workers("init_worker", all_kwargs)
-
-        self._run_workers("init_device")
-        self._run_workers("load_model",
-                          max_concurrent_workers=self.parallel_config.
-                          max_parallel_loading_workers)
+        self.collective_rpc("init_worker", args=(all_kwargs, ))
+        self.collective_rpc("init_device")
+        self.collective_rpc("load_model")
 
         if self.use_ray_spmd_worker:
             for pp_rank in range(self.parallel_config.pipeline_parallel_size):
@@ -362,3 +355,8 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                     assert len(self.pp_tp_workers[pp_rank]) == tp_rank
                     assert pp_rank < len(self.pp_tp_workers)
                     self.pp_tp_workers[pp_rank].append(self.workers[rank])
+
+    # Ray executor do not need handshake metadata
+    # as we pass the kv_parameters through proxy server
+    def get_kv_connector_handshake_metadata(self) -> None:
+        pass

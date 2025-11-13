@@ -42,6 +42,12 @@ for folder_path in $TARGET_FOLDERS; do
         "features")
           feature_list+=("${subject_name}")
           ;;
+        "parallelism")
+          feature_list+=("${subject_name}")
+          ;;
+        "quatization")
+          feature_list+=("${subject_name}")
+          ;;
       esac
     fi
 
