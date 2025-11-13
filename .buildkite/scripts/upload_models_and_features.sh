@@ -5,7 +5,7 @@ TARGET_FOLDERS="models features"
 MODEL_LIST_KEY="model-list"
 FEATURE_LIST_KEY="feature-list"
 
-DEV_ALLOWED_TARGET=("meta-llama/Llama-3.1-8B-Instruct" "Qwen/Qwen3-4B" "Chunked Prefill")
+DEV_ALLOWED_TARGET=()
 
 declare -a pipeline_steps
 
