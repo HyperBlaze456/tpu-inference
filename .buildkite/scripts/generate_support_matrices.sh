@@ -13,15 +13,12 @@ mapfile -t metadata_feature_list < <(buildkite-agent meta-data get "${FEATURE_LI
 MODEL_STAGES=("UnitTest" "IntegrationTest" "Benchmark")
 FEATURE_STAGES=("CorrectnessTest" "PerformanceTest")
 
-# These arrays will hold the filenames of all generated CSVs for final upload
 declare -a model_csv_files=()
 declare -a feature_csv_files=()
-
-# Parse Default Features File & Set Categories
 declare -a default_feature_names=()
 
+# Parse Default Features File & Set Categories
 if [[ -f "${DEFAULT_FEATURES_FILE}" ]]; then
-    # Read file, strip carriage returns and empty lines
     mapfile -t raw_default_lines < <(sed 's/\r$//; /^$/d' "${DEFAULT_FEATURES_FILE}")
     
     # Regex to capture "Feature Name (Category Name)"
@@ -84,11 +81,10 @@ process_features() {
     for feature in "$@"; do
         if [[ -z "$feature" ]]; then continue; fi
 
-        # Get Category
+        # Get Category (default: feature support matrix)
         local category
         category=$(buildkite-agent meta-data get "${feature}_category" --default "feature support matrix")
 
-        # Prepare CSV File
         local category_filename=${category// /_}
         local category_csv="${category_filename}.csv"
 
@@ -129,8 +125,7 @@ fi
 
 buildkite-agent meta-data set "CI_TESTS_FAILED" "${ANY_FAILED}"
 
-# Reporting & Uploading
-echo "--- Model support matrices ---"
+# Model support matrices
 for csv_file in "${model_csv_files[@]}"; do
     if [[ -f "$csv_file" ]]; then
         echo "--- $csv_file ---"
@@ -139,7 +134,7 @@ for csv_file in "${model_csv_files[@]}"; do
     fi
 done
 
-echo "--- Feature support matrices ---"
+# Feature support matrices
 for csv_file in "${feature_csv_files[@]}"; do
     if [[ -f "$csv_file" ]]; then
         echo "--- $csv_file ---"

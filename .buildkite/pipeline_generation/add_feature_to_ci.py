@@ -12,8 +12,6 @@ OUTPUT_DIR = SCRIPT_DIR.parent / "features"
 class FeatureCategory(str, Enum):
     FEATURE_SUPPORT = "feature support matrix"
     KERNEL_SUPPORT = "kernel support matrix"
-    QUANTIZATION_SUPPORT = "quantization support matrix"
-    PARALLELISM_SUPPORT = "parallelism support matrix"
 
 def generate_from_template(feature_name: str, feature_category: str, queue: str) -> None:
     """
@@ -99,8 +97,7 @@ def main():
         help="The name of the agent queue to use (ex: 'tpu_v6e_queue')")
     parser.add_argument(
         '--category',
-        choices=[FeatureCategory.FEATURE_SUPPORT.value, FeatureCategory.KERNEL_SUPPORT.value, 
-                 FeatureCategory.QUANTIZATION_SUPPORT.value, FeatureCategory.PARALLELISM_SUPPORT.value],
+        choices=[FeatureCategory.FEATURE_SUPPORT.value, FeatureCategory.KERNEL_SUPPORT.value],
         default='feature support matrix',
         help=
         '[OPTIONAL] Category of feature. (Default: feature support matrix)'
