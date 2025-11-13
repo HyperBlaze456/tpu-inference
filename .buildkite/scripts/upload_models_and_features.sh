@@ -1,7 +1,7 @@
 #!/bin/bash
 
 BUILDKITE_DIR=".buildkite"
-TARGET_FOLDERS="models features"
+TARGET_FOLDERS="models features parallelism quatization"
 MODEL_LIST_KEY="model-list"
 FEATURE_LIST_KEY="feature-list"
 
