@@ -24,6 +24,10 @@ from vllm.model_executor.layers.quantization.mxfp4 import (Mxfp4Backend,
 from vllm.model_executor.layers.quantization.utils.quant_utils import \
     is_layer_skipped
 
+from tpu_inference.layers.common.quantization import (MXFP4_BLOCK_SIZE,
+                                                      dequantize_weight,
+                                                      e8m0_to_fp32,
+                                                      u8_unpack_e2m1)
 from tpu_inference.layers.vllm.fused_moe import fused_moe_func_padded
 from tpu_inference.layers.vllm.linear_common import \
     reorder_concatenated_tensor_for_sharding
@@ -31,37 +35,8 @@ from tpu_inference.layers.vllm.quantization.common import JaxCommonConfig
 from tpu_inference.layers.vllm.quantization.unquantized import \
     VllmUnquantizedLinearMethod
 
-MXFP4_BLOCK_SIZE = 32
-
 P = PartitionSpec
 logger = init_logger(__name__)
-
-
-# TODO(kyuyeunk): Move these functions into a common utility file.
-def u8_unpack_e2m1(u8_packed_e2m1: jax.Array) -> jax.Array:
-    assert u8_packed_e2m1.dtype == jnp.uint8
-    e2m1 = jax.lax.bitcast_convert_type(u8_packed_e2m1, jnp.float4_e2m1fn)
-    # bitcast creates one more dimension that splits 8 bits into two e2m1.
-    # we flatten them with the last dim.
-    return jnp.reshape(e2m1, e2m1.shape[:-2] + (-1, ))
-
-
-def e8m0_to_fp32(u8: jax.Array) -> jax.Array:
-    e8_finfo = jnp.finfo(jnp.float8_e8m0fnu)
-    exponents = u8.astype(jnp.int32) + e8_finfo.minexp
-    ones = jnp.ones_like(u8, dtype=jnp.float32)
-    return jnp.ldexp(ones, exponents)
-
-
-def dequantize_block_weight(weight: jax.Array,
-                            scale: jax.Array,
-                            block_size: int,
-                            out_dtype: jnp.dtype = jnp.bfloat16) -> jax.Array:
-    orig_shape = weight.shape
-    weight_block = weight.reshape(orig_shape[:-1] + (-1, block_size))
-    weight_dequantized = weight_block.astype(jnp.float32) * jnp.expand_dims(
-        scale, -1)
-    return weight_dequantized.reshape(orig_shape).astype(out_dtype)
 
 
 @register_quantization_config("tpu-mxfp4")
@@ -129,10 +104,12 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
 
         # We dequantize fp4 weights into bf16.
         # TODO(kyuyeunk): Add native support for MXFP4.
-        w13_weight = dequantize_block_weight(w13_weight, w13_weight_scale,
-                                             MXFP4_BLOCK_SIZE, jnp.bfloat16)
-        w2_weight = dequantize_block_weight(w2_weight, w2_weight_scale,
-                                            MXFP4_BLOCK_SIZE, jnp.bfloat16)
+        w13_weight = dequantize_weight(w13_weight,
+                                       w13_weight_scale,
+                                       block_size=MXFP4_BLOCK_SIZE)
+        w2_weight = dequantize_weight(w2_weight,
+                                      w2_weight_scale,
+                                      block_size=MXFP4_BLOCK_SIZE)
 
         # Because we have dequantized weights, scales are not used anymore.
         delattr(layer, "w13_weight_scale")

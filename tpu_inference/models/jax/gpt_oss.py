@@ -11,6 +11,9 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from vllm.config import VllmConfig
 
+from tpu_inference.layers.common.quantization import (dequantize_mxfp4_tensor,
+                                                      e8m0_to_fp32,
+                                                      u8_unpack_e2m1)
 from tpu_inference.layers.jax.attention.gpt_oss_attention import (
     AttentionMetadata, GptOssAttention)
 from tpu_inference.layers.jax.constants import KVCacheType
@@ -18,8 +21,6 @@ from tpu_inference.layers.jax.layers import Embedder, LMhead, RMSNorm
 from tpu_inference.layers.jax.moe.gpt_oss_moe import GptOssMoE, GptOssRouter
 from tpu_inference.layers.jax.transformer_block import TransformerBlock
 from tpu_inference.logger import init_logger
-from tpu_inference.models.jax.utils.quantization.mxfp4_utils import (
-    MXFP4_QUANT_METHOD, dequant_mxfp4_to_bf16, unpack_mxfp4_to_fp32)
 from tpu_inference.models.jax.utils.weight_utils import (
     get_param, model_weights_generator, print_param_info)
 
@@ -31,6 +32,9 @@ DTYPE_VIEW_MAP = {
     jnp.dtype(jnp.bfloat16): torch.uint16,
     jnp.dtype(jnp.float32): torch.uint32,
 }
+
+# TODO(kyuyeunk): Consolidate quant method strings into a single place.
+MXFP4_QUANT_METHOD = "mxfp4"
 
 
 @dataclass
@@ -316,8 +320,9 @@ class GptOss(nnx.Module):
                     blocks_u8, scales_u8 = loaded_weight
                     # Quantized param (QArray): set qvalue/scale directly and skip regular path
                     if hasattr(model_weight, "array"):  # QArray check
-                        codes_fp32_t, scales_fp32_t = unpack_mxfp4_to_fp32(
-                            blocks_u8, scales_u8)
+                        codes_fp32_t = u8_unpack_e2m1(blocks_u8).astype(
+                            jnp.float32)
+                        scales_fp32_t = e8m0_to_fp32(scales_u8)
                         self._load_mxfp4(
                             model_weight=model_weight,
                             codes_fp32_t=codes_fp32_t,
@@ -328,7 +333,7 @@ class GptOss(nnx.Module):
                             print_param_info(model_weight, loaded_name)
                         continue
                     # Not a QArray: dequantize MXFP4 to BF16 full weights
-                    prepared_weight = dequant_mxfp4_to_bf16(
+                    prepared_weight = dequantize_mxfp4_tensor(
                         blocks_u8, scales_u8)
 
                 # Single regular-tensor load call (BF16 or dequantized MXFP4)

@@ -1,7 +1,6 @@
 import tempfile
 
 import jax
-import jax.numpy as jnp
 import pytest
 import torch
 import torchax
@@ -16,41 +15,13 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 
+from tpu_inference.layers.common.quantization import quantize_to_mxfp4_packed
 from tpu_inference.layers.vllm.quantization import get_tpu_quantization_config
 from tpu_inference.layers.vllm.quantization.mxfp4 import (VllmMxfp4Config,
                                                           VllmMxfp4MoEMethod)
 
 P = PartitionSpec
 MODELS = ["openai/gpt-oss-20b"]
-MXFP4_BLOCK_SIZE = 32
-
-
-def quantize_to_mxfp4(weight: torch.tensor):
-    # Utilize JAX because native support for e2m1 makes it easier to work with.
-    weight = t2j(weight)
-    e2m1_finfo = jnp.finfo(jnp.float4_e2m1fn)
-    dtype_min = float(e2m1_finfo.min)
-    dtype_max = float(e2m1_finfo.max)
-
-    # Do a subchannel quantization where block size is 32.
-    weight_shape = weight.shape
-    weight_block = weight.reshape(weight_shape[:-1] + (-1, MXFP4_BLOCK_SIZE))
-    abs_max = jnp.max(jnp.abs(weight_block), axis=-1, keepdims=True)
-    scale = abs_max / dtype_max
-
-    weight_q = jnp.clip(weight_block / scale, dtype_min, dtype_max)
-    weight_q = weight_q.astype(jnp.float4_e2m1fn).reshape(weight_shape[:-1] +
-                                                          (-1, 2))
-    weight_packed = jax.lax.bitcast_convert_type(weight_q, jnp.uint8)
-
-    # We convert scale into e8m0 manually because there is no hardware support.
-    e8m0_finfo = jnp.finfo(jnp.float8_e8m0fnu)
-    _, scale_exp = jnp.frexp(scale.squeeze(axis=-1))
-    # Subtract by one sinced e8m0 has no decimal
-    scale_exp -= 1
-    scale_exp = (scale_exp - e8m0_finfo.minexp).astype(jnp.uint8)
-
-    return j2t(weight_packed), j2t(scale_exp)
 
 
 @pytest.fixture(autouse=True)
@@ -120,8 +91,8 @@ def test_fused_moe_bias(mesh, num_tokens, intermediate_size, hidden_size,
         (num_experts, 2 * intermediate_size, hidden_size), dtype=dtype) / 10
     w2 = torch.randn(
         (num_experts, hidden_size, intermediate_size), dtype=dtype) / 10
-    w1_weight, w1_weight_scale = quantize_to_mxfp4(w1)
-    w2_weight, w2_weight_scale = quantize_to_mxfp4(w2)
+    w1_weight, w1_weight_scale = j2t(quantize_to_mxfp4_packed(t2j(w1)))
+    w2_weight, w2_weight_scale = j2t(quantize_to_mxfp4_packed(t2j(w2)))
 
     print(f'kky {w1_weight.shape=} {w1_weight_scale.shape=}')
 
