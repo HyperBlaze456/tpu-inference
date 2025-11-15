@@ -17,6 +17,7 @@ steps:
       CI_TARGET: meta-llama/Llama-Guard-4-12B
       #Adding DUMMY_VAR to see if this will trigger the entire CI test suite
       DUMMY_VAR: 42
+      ANOTHER_DUMMY_VAR: 1337
     agents:
       queue: cpu
     commands:
