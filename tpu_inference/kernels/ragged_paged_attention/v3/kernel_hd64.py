@@ -395,7 +395,7 @@ def _ragged_paged_attention_kernel(
                   num_q_heads_per_kv_head)
         # k index of each elements in s.
         k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s.shape, 1)
-        mask = jnp.logical_and(k_span <= q_span, k_span < kv_len)
+        mask = k_span < jnp.minimum(q_span + 1, kv_len)
         s = jnp.where(mask, s, mask_value)
 
         s_rowmax = jnp.max(s, axis=1, keepdims=True)
@@ -721,7 +721,6 @@ def _ragged_paged_attention_kernel(
         for i in range(0, kv_packing):
             cur_kv = pltpu.bitcast((kv >> (i * bitwidth)).astype(repack_ty),
                                    kv_dtype)
-            cur_kv = jnp.nan_to_num(cur_kv)
             lst.append(cur_kv)
         return lst
 
@@ -880,6 +879,8 @@ def _ragged_paged_attention_kernel(
 
     @pl.when(seq_idx == 0)
     def prologue():
+        # Initialize bkv scratch to zero.
+        bkv_x2_ref[...] = jnp.zeros(bkv_x2_ref.shape, bkv_x2_ref.dtype)
         start_fetch_bq(0, 0, 0)
         start_fetch_bkv(0, bkv_idx_start, 0)
 
