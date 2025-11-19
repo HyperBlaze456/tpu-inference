@@ -391,6 +391,8 @@ def _ragged_paged_attention_kernel(
                   lax.broadcasted_iota(jnp.int32, s.shape, 0) //
                   num_q_heads_per_kv_head)
         k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s.shape, 1)
+        mask = jnp.logical_and(k_span <= q_span, k_span < kv_len)
+        s = jnp.where(mask, s, mask_value)
         mask = q_span < k_span
 
         if soft_cap is not None:
@@ -715,7 +717,7 @@ def _ragged_paged_attention_kernel(
             bkv_sz * step, actual_head_dim_x2))
 
         kv = strided_load(kv_ref, start, step)
-        kv = lax.select(bkv_mask, kv, jnp.zeros_like(kv))
+        # kv = lax.select(bkv_mask, kv, jnp.zeros_like(kv))
         bitwidth = 32 // kv_packing
         repack_ty = jnp.dtype(f"uint{bitwidth}")
         lst = []
@@ -885,6 +887,8 @@ def _ragged_paged_attention_kernel(
 
     @pl.when(seq_idx == 0)
     def prologue():
+        # Initialize bkv scratch to zero.
+        bkv_x2_ref[...] = jnp.zeros(bkv_x2_ref.shape, bkv_x2_ref.dtype)
         start_fetch_bq(0, 0, 0)
         start_fetch_bkv(0, bkv_idx_start, 0)
 
