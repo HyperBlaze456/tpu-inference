@@ -1390,6 +1390,7 @@ def ragged_paged_attention_hd64(
             page_size,
             max_num_tokens,
             pages_per_seq,
+            sliding_window,
         )
     bkv_sz = bkv_p * page_size
     if vmem_limit_bytes is None:
