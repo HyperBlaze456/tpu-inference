@@ -293,7 +293,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             sharding_strategy.expert_size,
             sharding_strategy.tp_size,
         )
-        logger.warning(f"**********mesh_shape = {mesh_shape}")
+        # logger.warning(f"**********mesh_shape = {mesh_shape}")
         return mesh_utils.create_device_mesh(
             mesh_shape,
             self.devices,
@@ -652,7 +652,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
     ) -> tuple[AttentionMetadata, ModelRunnerOutput | None]:
         self.persistent_batch_manager.update_states(
             scheduler_output, self.get_mrope_input_positions_fn)
-        logger.warning("******* executing model!")
+        # logger.warning("******* executing model!")
         if not scheduler_output.total_num_scheduled_tokens:
             if has_kv_transfer_group():
                 return DUMMY_METADATA, self.kv_connector_no_forward(
@@ -669,7 +669,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 # raise Exception(
                 #     "Should not schedule a request that does nothing!")
             return DUMMY_METADATA, EMPTY_MODEL_RUNNER_OUTPUT
-        logger.warning("******* preparing_inputs!")
+        # logger.warning("******* preparing_inputs!")
         # TODO(pooyam): I guess we can remove returning sampling_metadata in `_prepare_inputs` after https://github.com/njhill/vllm/commit/b7433ca1a47732394b1bdea4099d98389515954b
         (
             input_ids,
@@ -679,7 +679,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             spec_decode_metadata,
             logits_indices_selector,
         ) = self._prepare_inputs(scheduler_output)
-        logger.warning("******* prepared inputs!")
+        # logger.warning("******* prepared inputs!")
         # multi-modal support
         if self.is_multimodal_model:
             # Run the multimodal encoder if any.
@@ -1109,14 +1109,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         return input_ids
 
     def _prepare_inputs(self, scheduler_output: "VllmSchedulerOutput"):
-        logger.warning(f"*******self.dp_size = {self.dp_size}")
+        # logger.warning(f"*******self.dp_size = {self.dp_size}")
         if self.dp_size > 1:
             return self._prepare_inputs_dp(scheduler_output)
         else:
             return self._prepare_inputs_non_dp(scheduler_output)
 
     def _prepare_inputs_dp(self, scheduler_output: "VllmSchedulerOutput"):
-        logger.warning("*******Using DP input prep!")
+        # logger.warning("*******Using DP input prep!")
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
@@ -1201,7 +1201,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             input_ids_cpu[total_num_scheduled_tokens:] = 0
 
         # Prepare the attention metadata (query_start_loc_cpu, seq_lens_cpu)
-        logger.warning(f"**********dp_size = {dp_size}")
+        # logger.warning(f"**********dp_size = {dp_size}")
         for dp_rank in range(dp_size):
             req_offset = dp_rank * max_num_reqs_per_dp_rank
             query_start_loc_cpu = self.query_start_loc_cpu[
