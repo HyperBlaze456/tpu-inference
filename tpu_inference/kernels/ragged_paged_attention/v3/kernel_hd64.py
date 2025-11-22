@@ -317,8 +317,8 @@ def _ragged_paged_attention_kernel(
     q_len = q_end - q_start
     kv_len = kv_lens_ref[seq_idx]
 
-    bkv_idx_start = 0 if sliding_window is None else jnp.maximum(
-        kv_len - sliding_window, 0) // bkv_sz
+    bkv_idx_start = (0 if sliding_window is None else
+                     jnp.maximum(kv_len - q_len - sliding_window, 0) // bkv_sz)
 
     if sliding_window is None:
         next_bkv_idx_start = 0
@@ -326,7 +326,9 @@ def _ragged_paged_attention_kernel(
 
         def get_next_bkv_idx_start():
             next_kv_len = kv_lens_ref[seq_idx + 1]
-            return jnp.maximum(next_kv_len - sliding_window, 0) // bkv_sz
+            next_q_len = cu_q_lens_ref[seq_idx + 2] - q_end
+            return jnp.maximum(next_kv_len - next_q_len - sliding_window,
+                               0) // bkv_sz
 
         next_bkv_idx_start = lax.cond(seq_idx + 1 < num_seqs,
                                       get_next_bkv_idx_start, lambda: 0)
@@ -386,16 +388,16 @@ def _ragged_paged_attention_kernel(
             s *= k_scale
         if q_scale is not None:
             s *= q_scale
+        if soft_cap is not None:
+            s = soft_cap * jnp.tanh(s / soft_cap)
 
         q_span = (kv_len - q_len + bq_idx * bq_sz +
                   lax.broadcasted_iota(jnp.int32, s.shape, 0) //
                   num_q_heads_per_kv_head)
         k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s.shape, 1)
-        mask = q_span < k_span
+        mask = k_span <= q_span
 
-        if soft_cap is not None:
-            s = soft_cap * jnp.tanh(s / soft_cap)
-        s += jnp.where(mask, mask_value, 0.0)
+        s = jnp.where(mask, s, mask_value)
         s_rowmax = jnp.max(s, axis=1, keepdims=True)
 
         if attention_sink_ref is not None:
@@ -760,13 +762,19 @@ def _ragged_paged_attention_kernel(
             next_seq_idx = lax.select(is_last_bq, seq_idx + 1, seq_idx)
             next_bkv_sem_idx = lax.select(bkv_sem_idx == 0, 1, 0)
 
-            next_bkv_idx = lax.select(
-                is_last_bkv,
-                lax.select(
-                    is_last_bq,
-                    next_bkv_idx_start,
-                    bkv_idx_start,
-                ), next_bkv_idx)
+            if sliding_window is not None:
+                next_bkv_idx = lax.select(
+                    is_last_bkv,
+                    lax.select(
+                        is_last_bq,
+                        next_bkv_idx_start,
+                        bkv_idx_start,
+                    ),
+                    next_bkv_idx,
+                )
+            else:
+                next_bkv_idx = lax.select(is_last_bkv, 0, next_bkv_idx)
+
             return next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx
 
         def compute_with_bq(bq_idx, _):
@@ -1292,42 +1300,41 @@ def ragged_paged_attention_hd64(
     # Debug params.
     debug_mode: bool = False,
 ):
-    """A special Ragged paged attention version for head_dim=64 that supports mixed
+    """A variant of ragged paged attention head_dim=64.
 
-    prefill and decode.
+  Args:
+    queries: concatenated all sequences' queries.
+    keys: concatenated all sequences' keys (quantized).
+    values: concatenated all sequences' values (quantized).
+    kv_cache: paged KV cache with TPU-friendly shape.
+    kv_lens: padded kv lengths. Only the first num_seqs values are valid.
+    page_indices: flattened page indices look-up table by (seq_id, page_id).
+    cu_q_lens: the cumulative sum of the effective query lengths. Similar to
+      kv_lens, only the first num_seqs+1 values are valid.
+    distribution: (i, j, k) represents that sequences[0:i] are decode-only,
+      sequences[i:j] are chunked-prefill-only, and sequences[j:k] are mixed.
+      The k is also the total number of sequences.
+    attention_sink: optional attention sink for each q head.
+    actual_head_dim: the actual head size of the attention. Here we assume k
+      and v have the same actual head size.
+    sm_scale: the softmax scale which will be applied to the Q@K^T.
+    sliding_window: the sliding window size for the attention.
+    soft_cap: the logit soft cap for the attention.
+    mask_value: mask value for causal mask.
+    k_scale: the scale for the key cache.
+    v_scale: the scale for the value cache.
+    num_kv_pages_per_block: number of kv pages to be processed in one flash
+      attention block in the pallas kernel.
+    num_queries_per_block: number of kv pages to be processed in one flash
+      attention block in the pallas kernel.
+    vmem_limit_bytes: the vmem limit for the pallas kernel.
+    debug_mode: if true, RPA does not issue any DMAs or run flash attention
+      but print debug info. Need to compile with
+      `--xla_tpu_enable_log_recorder`.
 
-    Args:
-        queries: concatenated all sequences' queries.
-        keys: concatenated all sequences' keys (quantized).
-        values: concatenated all sequences' values (quantized).
-        kv_cache: paged KV cache with TPU-friendly shape.
-        kv_lens: padded kv lengths. Only the first num_seqs values are valid.
-        page_indices: flattened page indices look-up table by (seq_id, page_id).
-        cu_q_lens: the cumulative sum of the effective query lengths. Similar to
-        kv_lens, only the first num_seqs+1 values are valid.
-        distribution: (i, j, k) represents that sequences[0:i] are decode-only,
-        sequences[i:j] are chunked-prefill-only, and sequences[j:k] are mixed. The
-        k is also the total number of sequences.
-        attention_sink: optional attention sink for each q head.
-        actual_head_dim: the actual head size of the attention. Here we assume k and
-        v have the same actual head size.
-        sm_scale: the softmax scale which will be applied to the Q@K^T.
-        sliding_window: the sliding window size for the attention.
-        soft_cap: the logit soft cap for the attention.
-        mask_value: mask value for causal mask.
-        k_scale: the scale for the key cache.
-        v_scale: the scale for the value cache.
-        num_kv_pages_per_block: number of kv pages to be processed in one flash
-        attention block in the pallas kernel.
-        num_queries_per_block: number of kv pages to be processed in one flash
-        attention block in the pallas kernel.
-        vmem_limit_bytes: the vmem limit for the pallas kernel.
-        debug_mode: if true, RPA does not issue any DMAs or run flash attention but
-        print debug info. Need to compile with `--xla_tpu_enable_log_recorder`.
-
-    Returns:
-        The output of the attention.
-    """
+  Returns:
+    The output of the attention.
+  """
     q, k, v = queries, keys, values
     static_validate_inputs(
         q,
@@ -1397,7 +1404,7 @@ def ragged_paged_attention_hd64(
         pl.BlockSpec(memory_space=pltpu.HBM),
         pl.BlockSpec(memory_space=pltpu.HBM),
         None if attention_sink is None else pl.BlockSpec(
-            memory_space=pltpu.VMEM)
+            memory_space=pltpu.VMEM),
     ]
 
     out_specs = [
