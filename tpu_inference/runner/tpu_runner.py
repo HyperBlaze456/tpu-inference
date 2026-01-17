@@ -522,8 +522,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             "get_mrope_input_positions_fn", None)
         if self.uses_mrope and self.get_mrope_input_positions_fn is None:
             from tpu_inference.runner.mrope_utils import (
-                get_qwen3vl_mrope_input_positions, is_qwen3vl_config)
-            if is_qwen3vl_config(self.model_config.hf_config):
+                get_qwen3vl_moe_mrope_input_positions,
+                get_qwen3vl_mrope_input_positions,
+                is_qwen3vl_config,
+                is_qwen3vl_moe_config,
+            )
+            hf_config = self.model_config.hf_config
+            if is_qwen3vl_moe_config(hf_config):
+                self.get_mrope_input_positions_fn = (
+                    get_qwen3vl_moe_mrope_input_positions)
+            elif is_qwen3vl_config(hf_config):
                 self.get_mrope_input_positions_fn = (
                     get_qwen3vl_mrope_input_positions)
 

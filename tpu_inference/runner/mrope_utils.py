@@ -144,6 +144,19 @@ def get_qwen3vl_mrope_input_positions_raw(
     return llm_positions, mrope_position_delta
 
 
+def _expand_video_grid_thw_for_qwen3vl_moe(
+    video_grid_thw: list[tuple[int, int, int]] | None,
+) -> list[tuple[int, int, int]] | None:
+    if not video_grid_thw:
+        return video_grid_thw
+
+    expanded_video = []
+    for t, h, w in video_grid_thw:
+        t_val = int(t)
+        expanded_video.extend([(1, int(h), int(w))] * t_val)
+    return expanded_video
+
+
 def get_qwen3vl_mrope_input_positions(
     input_tokens: Sequence[int],
     hf_config=None,
@@ -178,8 +191,70 @@ def get_qwen3vl_mrope_input_positions(
     return llm_positions, mrope_position_delta
 
 
+def get_qwen3vl_moe_mrope_input_positions(
+    input_tokens: Sequence[int],
+    hf_config=None,
+    image_grid_thw=None,
+    video_grid_thw=None,
+    second_per_grid_ts=None,
+    context_len: int = 0,
+    seq_len: int | None = None,
+    audio_feature_lengths=None,
+    use_audio_in_video: bool = False,
+):
+    """Wrapper for Qwen3-VL-MoE M-RoPE, matching runner callback signature."""
+    del second_per_grid_ts, audio_feature_lengths, use_audio_in_video
+
+    if hf_config is None:
+        raise ValueError("hf_config is required for Qwen3-VL-MoE M-RoPE.")
+
+    image_grid_thw = _normalize_grid_thw(image_grid_thw)
+    video_grid_thw = _normalize_grid_thw(video_grid_thw)
+    video_grid_thw = _expand_video_grid_thw_for_qwen3vl_moe(video_grid_thw)
+
+    llm_positions, mrope_position_delta = get_qwen3vl_mrope_input_positions_raw(
+        input_tokens=input_tokens,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
+        image_token_id=hf_config.image_token_id,
+        video_token_id=hf_config.video_token_id,
+        vision_start_token_id=getattr(hf_config, "vision_start_token_id", None),
+        spatial_merge_size=hf_config.vision_config.spatial_merge_size,
+    )
+
+    llm_positions = llm_positions[:, context_len:seq_len]
+    return llm_positions, mrope_position_delta
+
+
+def is_qwen3vl_moe_config(hf_config) -> bool:
+    if hf_config is None:
+        return False
+
+    model_type = getattr(hf_config, "model_type", "")
+    if isinstance(model_type, str):
+        model_type_lower = model_type.lower()
+        if "qwen3_vl_moe" in model_type_lower:
+            return True
+
+    architectures = getattr(hf_config, "architectures", None) or []
+    for arch in architectures:
+        if "Qwen3VLMoe" in arch or "qwen3_vl_moe" in arch.lower():
+            return True
+
+    name_or_path = getattr(hf_config, "_name_or_path", "")
+    if isinstance(name_or_path, str):
+        name_lower = name_or_path.lower()
+        if "qwen3-vl" in name_lower and "moe" in name_lower:
+            return True
+
+    return False
+
+
 def is_qwen3vl_config(hf_config) -> bool:
     if hf_config is None:
+        return False
+
+    if is_qwen3vl_moe_config(hf_config):
         return False
 
     model_type = getattr(hf_config, "model_type", "")
@@ -190,7 +265,7 @@ def is_qwen3vl_config(hf_config) -> bool:
 
     architectures = getattr(hf_config, "architectures", None) or []
     for arch in architectures:
-        if "Qwen3VL" in arch or "Qwen3VLMoe" in arch:
+        if "Qwen3VL" in arch or "qwen3_vl" in arch.lower():
             return True
 
     name_or_path = getattr(hf_config, "_name_or_path", "")
