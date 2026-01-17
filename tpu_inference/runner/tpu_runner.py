@@ -520,6 +520,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                                      None)
         self.get_mrope_input_positions_fn = multimodal_fns.get(
             "get_mrope_input_positions_fn", None)
+        if self.uses_mrope and self.get_mrope_input_positions_fn is None:
+            from tpu_inference.runner.mrope_utils import (
+                get_qwen3vl_mrope_input_positions, is_qwen3vl_config)
+            if is_qwen3vl_config(self.model_config.hf_config):
+                self.get_mrope_input_positions_fn = (
+                    get_qwen3vl_mrope_input_positions)
 
         if self.drafter is not None:
             logger.info("Loading drafter model...")
