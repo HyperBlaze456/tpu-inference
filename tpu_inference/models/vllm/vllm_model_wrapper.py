@@ -82,6 +82,16 @@ class _VllmRunner(torch.nn.Module):
     def compute_logits(self, hidden_state: torch.Tensor) -> torch.Tensor:
         return self.vllm_model.compute_logits(hidden_state)
 
+    def embed_multimodal(self, **kwargs) -> Optional[Tuple[torch.Tensor, ...]]:
+        """Delegate to the underlying vLLM model's embed_multimodal method."""
+        if hasattr(self.vllm_model, 'embed_multimodal'):
+            return self.vllm_model.embed_multimodal(**kwargs)
+        return None
+
+    def has_embed_multimodal(self) -> bool:
+        """Check if the underlying model supports embed_multimodal."""
+        return hasattr(self.vllm_model, 'embed_multimodal')
+
 
 class VllmModelWrapper:
     """ Wraps a vLLM Pytorch model and let it run on the JAX engine. """
@@ -264,6 +274,66 @@ class VllmModelWrapper:
             return jax_view(logits)
 
         return compute_logits_func
+
+    def jit_embed_multimodal_func(self):
+        """Create a function for multimodal embedding.
+
+        This wraps the vLLM model's embed_multimodal method to work with JAX.
+        The interface matches what MultiModalManager expects:
+            embed_multimodal_fn(state, image_grid_thw, **batched_mm_inputs)
+
+        WARNING: This function may trigger recompilation frequently due to
+        dynamic shapes in multimodal inputs (varying image sizes, number of
+        images, etc.). Extra profiling and caution is recommended when using
+        this path. Consider monitoring compilation times and memory usage.
+        """
+        if not self.model.has_embed_multimodal():
+            return None
+
+        logger.warning(
+            "Using vLLM model's embed_multimodal via torchax. "
+            "This path may trigger frequent recompilations due to dynamic "
+            "multimodal input shapes. Monitor performance carefully."
+        )
+
+        def embed_multimodal_wrapper(
+            params_and_buffers: Any,
+            image_grid_thw: tuple,
+            **kwargs,
+        ):
+            with torchax.default_env():
+                # Convert JAX arrays in kwargs to torch tensors
+                torch_kwargs = {}
+                for key, value in kwargs.items():
+                    if hasattr(value, 'dtype') and hasattr(value, 'shape'):
+                        # Likely a JAX/numpy array
+                        try:
+                            torch_kwargs[key] = torch_view(value)
+                        except Exception:
+                            torch_kwargs[key] = value
+                    else:
+                        torch_kwargs[key] = value
+
+                # Add image_grid_thw to kwargs (vLLM expects it in kwargs)
+                if image_grid_thw:
+                    torch_kwargs["image_grid_thw"] = image_grid_thw
+
+                # Call the model's embed_multimodal directly
+                result = self.model.embed_multimodal(**torch_kwargs)
+
+                if result is None:
+                    return ()
+
+                # Convert torch tensors to JAX arrays
+                if isinstance(result, (list, tuple)):
+                    return tuple(jax_view(t) for t in result)
+                return (jax_view(result),)
+
+        return embed_multimodal_wrapper
+
+    def supports_multimodal(self) -> bool:
+        """Check if this model supports multimodal inputs."""
+        return self.model.has_embed_multimodal()
 
 
 def load_lora_model(model: torch.nn.Module, vllm_config: VllmConfig,

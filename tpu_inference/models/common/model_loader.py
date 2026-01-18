@@ -357,7 +357,39 @@ def get_vllm_model(
     compute_logits_fn = model.jit_compute_logits_func()
     # the model needs to be returned because lora weights are neither torch.nn.parameter nor torch.nn.buffer. After we load the lora weights and set it to the torch.nn.Module, we can shard it and move it to TPU.
     combine_hidden_states_fn = None
-    return jit_model, compute_logits_fn, combine_hidden_states_fn, None, params, lora_manager, model
+
+    # Build multimodal_fns if the model supports it
+    multimodal_fns = None
+    if model.supports_multimodal():
+        from tpu_inference.runner.mrope_utils import (
+            get_qwen3vl_moe_mrope_input_positions,
+            get_qwen3vl_mrope_input_positions,
+            is_qwen3vl_config,
+            is_qwen3vl_moe_config,
+        )
+
+        embed_multimodal_fn = model.jit_embed_multimodal_func()
+
+        # Determine the appropriate mrope function based on model architecture
+        hf_config = vllm_config.model_config.hf_config
+        get_mrope_input_positions_fn = None
+        if is_qwen3vl_moe_config(hf_config):
+            get_mrope_input_positions_fn = get_qwen3vl_moe_mrope_input_positions
+        elif is_qwen3vl_config(hf_config):
+            get_mrope_input_positions_fn = get_qwen3vl_mrope_input_positions
+
+        multimodal_fns = {
+            "precompile_vision_encoder_fn": None,
+            "embed_multimodal_fn": embed_multimodal_fn,
+            "embed_input_ids_fn": None,
+            "get_mrope_input_positions_fn": get_mrope_input_positions_fn,
+        }
+        logger.info(
+            f"vLLM model multimodal support enabled. "
+            f"mrope_fn={'qwen3vl_moe' if is_qwen3vl_moe_config(hf_config) else 'qwen3vl' if is_qwen3vl_config(hf_config) else 'none'}"
+        )
+
+    return jit_model, compute_logits_fn, combine_hidden_states_fn, multimodal_fns, params, lora_manager, model
 
 
 def get_model(
