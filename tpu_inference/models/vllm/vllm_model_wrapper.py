@@ -230,6 +230,9 @@ class VllmModelWrapper:
                     self.model, lora_metadata, self.vllm_config.lora_config)
                 if not is_first_rank:
                     intermediate_tensors = intermediate_tensors.to_torch()
+                torch_inputs_embeds = None
+                if input_embeds is not None:
+                    torch_inputs_embeds = torch_view(input_embeds)
                 output_from_torch = torch.func.functional_call(
                     self.model,
                     torch_view(params_and_buffers),
@@ -237,7 +240,7 @@ class VllmModelWrapper:
                         "input_ids": torch_view(input_ids),
                         "positions": torch_view(input_positions),
                         "intermediate_tensors": intermediate_tensors,
-                        "inputs_embeds": None,
+                        "inputs_embeds": torch_inputs_embeds,
                     },
                     tie_weights=False,
                 )

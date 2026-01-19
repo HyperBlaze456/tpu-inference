@@ -107,11 +107,11 @@ class CompilationManager:
                         self.runner.embed_input_ids_fn,
                         "_tpu_inference_skip_precompile", False):
                     self._precompile_input_embeddings_merger()
+                    self._precompile_backbone_with_inputs_embeds()
                 else:
                     logger.warning(
                         "Skipping input-embedding precompile: "
                         "embed_input_ids_fn is None or disabled.")
-                self._precompile_backbone_with_inputs_embeds()
             if self.runner.scheduler_config.async_scheduling:
                 self._precompile_substitute_placeholder_token()
             if not self.runner.is_last_rank:
