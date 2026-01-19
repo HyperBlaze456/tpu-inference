@@ -20,6 +20,8 @@ from typing import Any, List, Optional, Tuple
 from unittest.mock import patch
 
 import jax
+import jax.numpy as jnp
+import numpy as np
 import torch
 import torch.nn
 import torchax
@@ -49,6 +51,48 @@ from tpu_inference.models.vllm.vllm_model_wrapper_context import (
 from tpu_inference.runner.lora_utils import replace_lora_metadata
 
 logger = init_logger(__name__)
+
+
+def _numpy_to_torch(array: np.ndarray) -> torch.Tensor:
+    try:
+        return torch.from_numpy(array)
+    except Exception:
+        # Handle numpy/ML dtypes that torch.from_numpy can't ingest.
+        if str(array.dtype) == "bfloat16":
+            return torch.from_numpy(array.astype(np.float32)).to(torch.bfloat16)
+        return torch.tensor(array)
+
+
+def _coerce_to_torch_for_torchax(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, jax.Array):
+        return torch_view(value)
+    if isinstance(value, np.ndarray):
+        # Prefer torchax-friendly path: numpy -> jax -> torch
+        try:
+            return torch_view(jnp.asarray(value))
+        except Exception:
+            return _numpy_to_torch(value)
+    if isinstance(value, dict):
+        return {k: _coerce_to_torch_for_torchax(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return value
+        converted = [_coerce_to_torch_for_torchax(v) for v in value]
+        return type(value)(converted)
+    if hasattr(value, "dtype") and hasattr(value, "shape"):
+        # Likely a JAX/numpy array
+        try:
+            return torch_view(value)
+        except Exception:
+            try:
+                return _numpy_to_torch(np.asarray(value))
+            except Exception:
+                return value
+    return value
 
 
 class _VllmRunner(torch.nn.Module):
@@ -319,16 +363,8 @@ class VllmModelWrapper:
         ):
             with torchax.default_env():
                 # Convert JAX arrays in kwargs to torch tensors
-                torch_kwargs = {}
-                for key, value in kwargs.items():
-                    if hasattr(value, 'dtype') and hasattr(value, 'shape'):
-                        # Likely a JAX/numpy array
-                        try:
-                            torch_kwargs[key] = torch_view(value)
-                        except Exception:
-                            torch_kwargs[key] = value
-                    else:
-                        torch_kwargs[key] = value
+                torch_kwargs = {key: _coerce_to_torch_for_torchax(value)
+                                for key, value in kwargs.items()}
 
                 # Add image_grid_thw to kwargs (vLLM expects it in kwargs)
                 if image_grid_thw:
@@ -371,20 +407,22 @@ class VllmModelWrapper:
         ):
             del params_and_buffers
             with torchax.default_env():
-                torch_input_ids = torch_view(input_ids)
+                torch_input_ids = _coerce_to_torch_for_torchax(input_ids)
 
                 torch_mm = multimodal_embeddings
                 if torch_mm is not None:
-                    if isinstance(torch_mm, (list, tuple)):
-                        torch_mm = tuple(torch_view(x) for x in torch_mm)
-                    elif hasattr(torch_mm, 'dtype') and hasattr(
-                            torch_mm, 'shape'):
-                        torch_mm = torch_view(torch_mm)
+                    torch_mm = _coerce_to_torch_for_torchax(torch_mm)
+                    if isinstance(torch_mm, list):
+                        torch_mm = tuple(torch_mm)
 
                 kwargs.pop("num_tokens", None)
+                torch_kwargs = {
+                    key: _coerce_to_torch_for_torchax(value)
+                    for key, value in kwargs.items()
+                }
 
                 result = self.model.embed_input_ids(torch_input_ids, torch_mm,
-                                                    **kwargs)
+                                                    **torch_kwargs)
                 if result is None:
                     return None
                 return jax_view(result)
