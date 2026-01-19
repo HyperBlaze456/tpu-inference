@@ -369,6 +369,12 @@ def get_vllm_model(
         )
 
         embed_multimodal_fn = model.jit_embed_multimodal_func()
+        embed_input_ids_fn = None
+        if hasattr(model, "jit_embed_input_ids_func"):
+            embed_input_ids_fn = model.jit_embed_input_ids_func()
+        precompile_vision_encoder_fn = getattr(model,
+                                               "precompile_vision_encoder",
+                                               None)
 
         # Determine the appropriate mrope function based on model architecture
         hf_config = vllm_config.model_config.hf_config
@@ -379,9 +385,9 @@ def get_vllm_model(
             get_mrope_input_positions_fn = get_qwen3vl_mrope_input_positions
 
         multimodal_fns = {
-            "precompile_vision_encoder_fn": None,
+            "precompile_vision_encoder_fn": precompile_vision_encoder_fn,
             "embed_multimodal_fn": embed_multimodal_fn,
-            "embed_input_ids_fn": None,
+            "embed_input_ids_fn": embed_input_ids_fn,
             "get_mrope_input_positions_fn": get_mrope_input_positions_fn,
         }
         logger.info(

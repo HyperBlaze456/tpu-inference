@@ -1691,15 +1691,28 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
     def _get_input_ids_embeds(self, input_ids: jax.Array,
                               mm_embeds: list[jax.Array]):
-        if self.is_multimodal_model:
-            inputs_embeds = self.embed_input_ids_fn(
-                self.state,
-                input_ids,
-                mm_embeds,
-            )
-            return input_ids, inputs_embeds
-        else:
+        if not self.is_multimodal_model:
             return input_ids, None
+
+        if self.embed_input_ids_fn is None:
+            mm_present = mm_embeds is not None
+            if mm_present:
+                try:
+                    mm_present = len(mm_embeds) > 0
+                except TypeError:
+                    mm_present = True
+            if mm_present:
+                raise RuntimeError(
+                    "Multimodal embeddings are present but embed_input_ids_fn "
+                    "is not implemented for this model.")
+            return input_ids, None
+
+        inputs_embeds = self.embed_input_ids_fn(
+            self.state,
+            input_ids,
+            mm_embeds,
+        )
+        return input_ids, inputs_embeds
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
         return self.speculative_decoding_manager.take_draft_token_ids()

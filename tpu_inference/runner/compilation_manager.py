@@ -92,9 +92,23 @@ class CompilationManager:
         with self.runner.maybe_setup_dummy_loras(self.runner.lora_config):
             self._precompile_backbone_text_only()
             if self.runner.is_multimodal_model:
-                self.runner.precompile_vision_encoder_fn(
-                    self._run_compilation, )
-                self._precompile_input_embeddings_merger()
+                if self.runner.precompile_vision_encoder_fn is not None and not getattr(
+                        self.runner.precompile_vision_encoder_fn,
+                        "_tpu_inference_skip_precompile", False):
+                    self.runner.precompile_vision_encoder_fn(
+                        self._run_compilation, )
+                else:
+                    logger.warning(
+                        "Skipping vision encoder precompile: "
+                        "precompile_vision_encoder_fn is None or disabled.")
+                if self.runner.embed_input_ids_fn is not None and not getattr(
+                        self.runner.embed_input_ids_fn,
+                        "_tpu_inference_skip_precompile", False):
+                    self._precompile_input_embeddings_merger()
+                else:
+                    logger.warning(
+                        "Skipping input-embedding precompile: "
+                        "embed_input_ids_fn is None or disabled.")
                 self._precompile_backbone_with_inputs_embeds()
             if self.runner.scheduler_config.async_scheduling:
                 self._precompile_substitute_placeholder_token()

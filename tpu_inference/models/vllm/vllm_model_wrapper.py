@@ -92,6 +92,19 @@ class _VllmRunner(torch.nn.Module):
         """Check if the underlying model supports embed_multimodal."""
         return hasattr(self.vllm_model, 'embed_multimodal')
 
+    def embed_input_ids(self, *args, **kwargs) -> Optional[torch.Tensor]:
+        """Delegate to the underlying vLLM model's embed_input_ids/get_input_embeddings."""
+        if hasattr(self.vllm_model, 'embed_input_ids'):
+            return self.vllm_model.embed_input_ids(*args, **kwargs)
+        if hasattr(self.vllm_model, 'get_input_embeddings'):
+            return self.vllm_model.get_input_embeddings(*args, **kwargs)
+        return None
+
+    def has_embed_input_ids(self) -> bool:
+        """Check if the underlying model supports embed_input_ids/get_input_embeddings."""
+        return hasattr(self.vllm_model, 'embed_input_ids') or hasattr(
+            self.vllm_model, 'get_input_embeddings')
+
 
 class VllmModelWrapper:
     """ Wraps a vLLM Pytorch model and let it run on the JAX engine. """
@@ -330,6 +343,51 @@ class VllmModelWrapper:
                 return (jax_view(result),)
 
         return embed_multimodal_wrapper
+
+    def jit_embed_input_ids_func(self):
+        """Create a function to embed input ids and merge multimodal embeddings.
+
+        This wraps the vLLM model's embed_input_ids/get_input_embeddings
+        method to work with JAX. It is intentionally not jitted.
+        """
+        if not self.model.has_embed_input_ids():
+            return None
+
+        impl_name = ("embed_input_ids" if hasattr(self.model.vllm_model,
+                                                  "embed_input_ids") else
+                     "get_input_embeddings")
+        logger.warning(
+            "Using vLLM model's %s via torchax. This path is not jitted and "
+            "will not be precompiled.", impl_name)
+
+        def embed_input_ids_wrapper(
+            params_and_buffers: Any,  # unused, kept for API compatibility
+            input_ids: jax.Array,
+            multimodal_embeddings: Any = None,
+            **kwargs,
+        ):
+            del params_and_buffers
+            with torchax.default_env():
+                torch_input_ids = torch_view(input_ids)
+
+                torch_mm = multimodal_embeddings
+                if torch_mm is not None:
+                    if isinstance(torch_mm, (list, tuple)):
+                        torch_mm = tuple(torch_view(x) for x in torch_mm)
+                    elif hasattr(torch_mm, 'dtype') and hasattr(
+                            torch_mm, 'shape'):
+                        torch_mm = torch_view(torch_mm)
+
+                kwargs.pop("num_tokens", None)
+
+                result = self.model.embed_input_ids(torch_input_ids, torch_mm,
+                                                    **kwargs)
+                if result is None:
+                    return None
+                return jax_view(result)
+
+        embed_input_ids_wrapper._tpu_inference_skip_precompile = True
+        return embed_input_ids_wrapper
 
     def supports_multimodal(self) -> bool:
         """Check if this model supports multimodal inputs."""
