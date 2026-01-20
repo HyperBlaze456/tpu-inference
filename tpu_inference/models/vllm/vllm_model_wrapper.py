@@ -178,6 +178,9 @@ class _VllmRunner(torch.nn.Module):
         self.vllm_model = vllm_model
 
     def forward(self, **kwargs) -> torch.Tensor:
+        if "_tpu_inference_embed_multimodal_kwargs" in kwargs:
+            return self.embed_multimodal(
+                **kwargs["_tpu_inference_embed_multimodal_kwargs"])
         if "hidden_state" in kwargs:
             return self.compute_logits(kwargs["hidden_state"])
         else:
@@ -458,8 +461,16 @@ class VllmModelWrapper:
                     if seq is not None:
                         torch_kwargs["second_per_grid_ts"] = seq
 
-                # Call the model's embed_multimodal directly
-                result = self.model.embed_multimodal(**torch_kwargs)
+                # Call embed_multimodal via functional_call so parameters/buffers
+                # come from torchax-backed params_and_buffers.
+                result = torch.func.functional_call(
+                    self.model,
+                    torch_view(params_and_buffers),
+                    kwargs={
+                        "_tpu_inference_embed_multimodal_kwargs": torch_kwargs,
+                    },
+                    tie_weights=False,
+                )
 
                 if result is None:
                     return ()
