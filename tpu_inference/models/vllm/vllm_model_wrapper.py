@@ -95,6 +95,82 @@ def _coerce_to_torch_for_torchax(value: Any) -> Any:
     return value
 
 
+def _coerce_grid_thw_to_torch(grid_thw: Any) -> Optional[torch.Tensor]:
+    if grid_thw is None:
+        return None
+    if isinstance(grid_thw, torch.Tensor):
+        return grid_thw
+    if isinstance(grid_thw, jax.Array):
+        arr = jnp.asarray(grid_thw, dtype=jnp.int32)
+        if arr.size == 0:
+            return None
+        if arr.ndim == 1 and arr.shape[0] == 3:
+            arr = arr.reshape(1, 3)
+        elif arr.ndim == 3 and arr.shape[2] == 3:
+            arr = arr.reshape(-1, 3)
+        return torch_view(arr)
+    if isinstance(grid_thw, (list, tuple)):
+        if len(grid_thw) == 0:
+            return None
+        if len(grid_thw) == 3 and all(
+                isinstance(v, (int, np.integer)) for v in grid_thw):
+            grid_thw = [tuple(int(v) for v in grid_thw)]
+        else:
+            if (grid_thw and isinstance(grid_thw[0], (list, tuple, np.ndarray))
+                    and grid_thw[0]
+                    and isinstance(grid_thw[0][0],
+                                   (list, tuple, np.ndarray))):
+                # Flatten (B, N, 3) -> (B*N, 3)
+                grid_thw = [row for batch in grid_thw for row in batch]
+            grid_thw = [tuple(int(v) for v in row) for row in grid_thw]
+        try:
+            return torch_view(jnp.asarray(grid_thw, dtype=jnp.int32))
+        except Exception:
+            return torch.tensor(grid_thw, dtype=torch.int32)
+    if hasattr(grid_thw, "detach"):
+        grid_thw = grid_thw.detach().cpu()
+    if hasattr(grid_thw, "numpy"):
+        try:
+            grid_thw = grid_thw.numpy()
+        except Exception:
+            pass
+    arr = np.asarray(grid_thw)
+    if arr.size == 0:
+        return None
+    if arr.ndim == 1 and arr.shape[0] == 3:
+        arr = arr.reshape(1, 3)
+    elif arr.ndim == 3 and arr.shape[2] == 3:
+        arr = arr.reshape(-1, 3)
+    if arr.dtype != np.int32:
+        arr = arr.astype(np.int32)
+    try:
+        return torch_view(jnp.asarray(arr, dtype=jnp.int32))
+    except Exception:
+        return _numpy_to_torch(arr)
+
+
+def _coerce_scalar_sequence_to_torch(values: Any) -> Optional[torch.Tensor]:
+    if values is None:
+        return None
+    if isinstance(values, torch.Tensor):
+        return values
+    if isinstance(values, jax.Array):
+        return torch_view(jnp.asarray(values))
+    if isinstance(values, np.ndarray):
+        try:
+            return torch_view(jnp.asarray(values))
+        except Exception:
+            return _numpy_to_torch(values)
+    if isinstance(values, (list, tuple)):
+        if len(values) == 0:
+            return torch.tensor([], dtype=torch.int32)
+        try:
+            return torch_view(jnp.asarray(values))
+        except Exception:
+            return torch.tensor(values)
+    return None
+
+
 class _VllmRunner(torch.nn.Module):
 
     def __init__(self, vllm_model: torch.nn.Module):
@@ -358,7 +434,7 @@ class VllmModelWrapper:
 
         def embed_multimodal_wrapper(
             params_and_buffers: Any,
-            image_grid_thw: tuple,
+            image_grid_thw: object,
             **kwargs,
         ):
             with torchax.default_env():
@@ -367,8 +443,20 @@ class VllmModelWrapper:
                                 for key, value in kwargs.items()}
 
                 # Add image_grid_thw to kwargs (vLLM expects it in kwargs)
-                if image_grid_thw:
-                    torch_kwargs["image_grid_thw"] = image_grid_thw
+                if image_grid_thw is not None:
+                    grid_thw = _coerce_grid_thw_to_torch(image_grid_thw)
+                    if grid_thw is not None:
+                        torch_kwargs["image_grid_thw"] = grid_thw
+                if "video_grid_thw" in torch_kwargs:
+                    grid_thw = _coerce_grid_thw_to_torch(
+                        torch_kwargs["video_grid_thw"])
+                    if grid_thw is not None:
+                        torch_kwargs["video_grid_thw"] = grid_thw
+                if "second_per_grid_ts" in torch_kwargs:
+                    seq = _coerce_scalar_sequence_to_torch(
+                        torch_kwargs["second_per_grid_ts"])
+                    if seq is not None:
+                        torch_kwargs["second_per_grid_ts"] = seq
 
                 # Call the model's embed_multimodal directly
                 result = self.model.embed_multimodal(**torch_kwargs)
