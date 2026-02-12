@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import tempfile
+from unittest.mock import MagicMock, patch
 
 import jax.numpy as jnp
 import pytest
@@ -30,19 +31,28 @@ from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig, FusedMoEParallelConfig)
 
+from tests.layers.common import utils as test_utils
 from tpu_inference.layers.vllm.quantization import get_tpu_quantization_config
 from tpu_inference.layers.vllm.quantization.compressed_tensors.compressed_tensors import \
     VllmCompressedTensorsConfig
 from tpu_inference.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe import \
     VllmCompressedTensorsW8A8Fp8MoEMethod
 
-from . import utils as test_utils
-
 # yapf: enable
 
 P = PartitionSpec
 
 MODEL = 'BCCard/Qwen3-30B-A3B-FP8-Dynamic'
+
+
+@pytest.fixture(autouse=True)
+def mock_get_pp_group():
+    with patch("tpu_inference.distributed.jax_parallel_state.get_pp_group",
+               return_value=MagicMock(is_first_rank=True,
+                                      is_last_rank=True,
+                                      rank_in_group=0,
+                                      world_size=1)):
+        yield
 
 
 @pytest.fixture(autouse=True)

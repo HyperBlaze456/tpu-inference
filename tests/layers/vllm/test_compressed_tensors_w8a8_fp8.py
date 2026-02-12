@@ -14,6 +14,7 @@
 
 import tempfile
 from typing import Optional
+from unittest.mock import MagicMock, patch
 
 import jax
 import jax.numpy as jnp
@@ -37,6 +38,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
     CompressedTensorsLinearMethod
 from vllm.model_executor.model_loader import get_model as vllm_get_model
 
+from tests.layers.common import utils as test_utils
 from tpu_inference.layers.common.quantization import (dequantize_tensor,
                                                       quantize_tensor)
 from tpu_inference.layers.vllm.quantization import get_tpu_quantization_config
@@ -46,8 +48,6 @@ from tpu_inference.layers.vllm.quantization.compressed_tensors.schemes.compresse
     VllmCompressedTensorsW8A8Fp8
 from tpu_inference.layers.vllm.quantization.configs import \
     VllmQuantLinearConfig
-
-from . import utils as test_utils
 
 P = PartitionSpec
 MODELS = [
@@ -199,6 +199,16 @@ def initialize_layer_weights(layer: torch.nn.Module):
 
     if layer.bias is not None:
         layer.bias.data = torch.rand_like(layer.bias.data)
+
+
+@pytest.fixture(autouse=True)
+def mock_get_pp_group():
+    with patch("tpu_inference.distributed.jax_parallel_state.get_pp_group",
+               return_value=MagicMock(is_first_rank=True,
+                                      is_last_rank=True,
+                                      rank_in_group=0,
+                                      world_size=1)):
+        yield
 
 
 @pytest.fixture(autouse=True)

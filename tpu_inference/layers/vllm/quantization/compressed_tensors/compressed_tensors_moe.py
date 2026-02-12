@@ -19,17 +19,16 @@ from jax.sharding import Mesh
 from torch.nn.parameter import Parameter
 from torchax.interop import jax_view, torch_view
 from torchax.ops.mappings import t2j
-from vllm.model_executor.layers.fused_moe import (FusedMoE, FusedMoEConfig,
-                                                  FusedMoERouter)
+from vllm.model_executor.layers.fused_moe import FusedMoE, FusedMoEConfig
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
     CompressedTensorsMoEMethod, CompressedTensorsW8A8Fp8MoEMethod)
 
-from tpu_inference.layers.common.sharding import ShardingAxisName
-from tpu_inference.layers.vllm.fused_moe import (FusedMoEBackend,
-                                                 fused_moe_apply,
-                                                 select_moe_backend)
-from tpu_inference.layers.vllm.process_weights.fused_moe_weights import (
+from tpu_inference.layers.common.moe import MoEBackend
+from tpu_inference.layers.common.process_weights.moe_weights import (
     FusedMoEWeights, process_moe_weights, shard_moe_weights)
+from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.vllm.moe import (
+    select_moe_backend_from_fused_moe_config, vllm_moe_apply)
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.layers.vllm.quantization.unquantized import \
     VllmUnquantizedFusedMoEMethod
@@ -94,11 +93,15 @@ class VllmCompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod,
         super().__init__(weight_quant, input_quant, moe)
 
         self.mesh = mesh
-        self.moe_backend = select_moe_backend(self.moe)
+        self.moe_backend = select_moe_backend_from_fused_moe_config(self.moe)
 
         self.extra_backend_kwargs = {}
-        if self.moe_backend == FusedMoEBackend.FUSED_MOE:
+        if self.moe_backend == MoEBackend.FUSED_MOE:
             self.extra_backend_kwargs = dict(ep_axis_name=ep_axis_name, )
+
+    @property
+    def is_monolithic(self) -> bool:
+        return True
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """
@@ -186,10 +189,9 @@ class VllmCompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod,
             layer.w13_bias = Parameter(weights.w13_bias, requires_grad=False)
             layer.w2_bias = Parameter(weights.w2_bias, requires_grad=False)
 
-    def apply(
+    def apply_monolithic(
         self,
         layer: FusedMoE,
-        router: FusedMoERouter,
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
@@ -202,14 +204,8 @@ class VllmCompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod,
             w2_weight_scale=jax_view(layer.w2_weight_scale),
             w2_bias=jax_view(layer.w2_bias) if self.moe.has_bias else None,
         )
-
-        return torch_view(
-            fused_moe_apply(
-                layer,
-                jax_view(x),
-                jax_view(router_logits),
-                weights,
-                self.moe_backend,
-                self.mesh,
-                self.extra_backend_kwargs,
-            ))
+        return vllm_moe_apply(layer=layer,
+                              weights=weights,
+                              quant_method_instance=self,
+                              x=x,
+                              router_logits=router_logits)
