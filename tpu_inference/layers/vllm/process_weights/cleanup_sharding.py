@@ -67,6 +67,13 @@ def shard_model_to_tpu(model: torch.nn.Module,
             lambda tensor: _shard_tensor_to_tpu_replicated(tensor, mesh),
             (params, buffers))
 
+        # Convert non-registered tensor attributes (e.g. q_range, k_range,
+        # v_range from vLLM's Attention layers) to replicated XLATensors.
+        # torch.func.functional_call only swaps named_parameters() and
+        # named_buffers(); plain `self.*` tensor attributes are left as-is
+        # and would cause mixed torch.Tensor / XLATensor errors at runtime.
+        _convert_remaining_tensor_attrs_to_xla(model, mesh)
+
         return {**params, **buffers}
 
 
@@ -207,6 +214,44 @@ MODULE_TYPE_TO_SHARDING_FUNC = [
     (RowParallelLinearWithLoRA, _shard_row_parallel_linear_lora),
     (ReplicatedLinearWithLoRA, _shard_base_linear_lora_replicated),
 ]
+
+
+def _convert_remaining_tensor_attrs_to_xla(model: torch.nn.Module,
+                                            mesh: Mesh) -> None:
+    """Convert non-registered tensor attributes on all modules to XLATensors.
+
+    ``torch.func.functional_call`` only replaces tensors that are returned by
+    ``named_parameters()`` and ``named_buffers()``.  Any tensor stored as a
+    plain instance attribute (e.g. ``self.q_range``) is left untouched.  When
+    the forward pass later mixes these CPU tensors with XLATensors produced by
+    functional_call, torchax raises an ``AssertionError`` about mixed math.
+
+    This function walks every module and converts such "orphan" CPU tensors to
+    replicated XLATensors so that they are compatible with the rest of the
+    computation graph.
+    """
+    converted = 0
+    for mod_name, module in model.named_modules():
+        # Names already covered by functional_call.
+        registered = {n for n, _ in module.named_parameters(recurse=False)}
+        registered |= {n for n, _ in module.named_buffers(recurse=False)}
+        for attr_name in list(vars(module).keys()):
+            if attr_name.startswith("_") or attr_name in registered:
+                continue
+            attr = getattr(module, attr_name, None)
+            if isinstance(attr, torch.Tensor) and not isinstance(
+                    attr, torchax.tensor.Tensor):
+                xla_attr = _shard_tensor_to_tpu_replicated(attr, mesh)
+                setattr(module, attr_name, xla_attr)
+                full_name = f"{mod_name}.{attr_name}" if mod_name else attr_name
+                logger.debug(
+                    "Converted non-registered tensor attr %s to XLATensor",
+                    full_name)
+                converted += 1
+    if converted:
+        logger.info(
+            "Converted %d non-registered tensor attribute(s) to XLATensor",
+            converted)
 
 
 def _shard_module_to_tpu(model: torch.nn.Module, mesh: Mesh) -> None:
