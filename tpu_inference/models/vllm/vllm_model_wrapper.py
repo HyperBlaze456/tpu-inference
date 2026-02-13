@@ -54,6 +54,98 @@ from tpu_inference.runner.lora_utils import replace_lora_metadata
 
 logger = init_logger(__name__)
 
+# ---------------------------------------------------------------------------
+# Diagnostic: detect mixed torch.Tensor / XLATensor (torchax) contamination
+# ---------------------------------------------------------------------------
+_DTYPE_DIAG_LOGGED = False  # Only log the full model scan once
+
+
+def _tensor_type_tag(t: torch.Tensor) -> str:
+    """Return a short human-readable tag describing a tensor's backing."""
+    if isinstance(t, torchax.tensor.Tensor):
+        try:
+            jax_dev = t.jax_device
+            return f"XLATensor(dtype={t.dtype}, shape={list(t.shape)}, jax_device={jax_dev})"
+        except Exception:
+            return f"XLATensor(dtype={t.dtype}, shape={list(t.shape)})"
+    return f"CPUTensor(dtype={t.dtype}, shape={list(t.shape)}, device={t.device})"
+
+
+def _log_mixed_tensor_diagnostics(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    intermediate_tensors,
+    inputs_embeds,
+    params_and_buffers=None,
+):
+    """Log every tensor that is NOT an XLATensor — these are contamination sources."""
+    global _DTYPE_DIAG_LOGGED
+    issues = []
+
+    # 1. Check forward-call arguments
+    for arg_name, arg_val in [
+        ("input_ids", input_ids),
+        ("positions", positions),
+        ("inputs_embeds", inputs_embeds),
+    ]:
+        if arg_val is None:
+            continue
+        if isinstance(arg_val, torch.Tensor) and not isinstance(arg_val, torchax.tensor.Tensor):
+            issues.append(f"  ARG  {arg_name}: {_tensor_type_tag(arg_val)}  *** CPU ***")
+        elif isinstance(arg_val, torch.Tensor):
+            logger.debug("  ARG  %s: %s", arg_name, _tensor_type_tag(arg_val))
+
+    if intermediate_tensors is not None:
+        if hasattr(intermediate_tensors, 'tensors'):
+            for k, v in intermediate_tensors.tensors.items():
+                if isinstance(v, torch.Tensor) and not isinstance(v, torchax.tensor.Tensor):
+                    issues.append(f"  INTERMEDIATE  {k}: {_tensor_type_tag(v)}  *** CPU ***")
+
+    # 2. Check params_and_buffers dict (what functional_call injects)
+    if params_and_buffers is not None and isinstance(params_and_buffers, dict):
+        for name, val in params_and_buffers.items():
+            if isinstance(val, torch.Tensor) and not isinstance(val, torchax.tensor.Tensor):
+                issues.append(f"  PARAM/BUF  {name}: {_tensor_type_tag(val)}  *** CPU ***")
+
+    # 3. Full model scan — only once to avoid log spam
+    if not _DTYPE_DIAG_LOGGED:
+        _DTYPE_DIAG_LOGGED = True
+
+        # 3a. Registered parameters
+        for name, param in model.named_parameters():
+            if not isinstance(param, torchax.tensor.Tensor):
+                issues.append(f"  MODEL PARAM  {name}: {_tensor_type_tag(param)}  *** CPU ***")
+
+        # 3b. Registered buffers
+        for name, buf in model.named_buffers():
+            if not isinstance(buf, torchax.tensor.Tensor):
+                issues.append(f"  MODEL BUFFER  {name}: {_tensor_type_tag(buf)}  *** CPU ***")
+
+        # 3c. Non-registered tensor attributes (the sneaky ones —
+        #     e.g. inv_freq, cos_cached, sin_cached in RotaryEmbedding)
+        for mod_name, module in model.named_modules():
+            param_buf_names = {n for n, _ in module.named_parameters(recurse=False)}
+            param_buf_names |= {n for n, _ in module.named_buffers(recurse=False)}
+            for attr_name in list(vars(module).keys()):
+                if attr_name.startswith('_') or attr_name in param_buf_names:
+                    continue
+                attr = getattr(module, attr_name, None)
+                if isinstance(attr, torch.Tensor) and not isinstance(attr, torchax.tensor.Tensor):
+                    full_name = f"{mod_name}.{attr_name}" if mod_name else attr_name
+                    issues.append(
+                        f"  MODEL ATTR  {full_name}: {_tensor_type_tag(attr)}  *** CPU (not param/buffer) ***"
+                    )
+
+    if issues:
+        logger.warning(
+            "=== MIXED TENSOR DIAGNOSTIC: Found %d CPU tensor(s) in XLATensor context ===\n%s",
+            len(issues),
+            "\n".join(issues),
+        )
+    else:
+        logger.info("=== MIXED TENSOR DIAGNOSTIC: All tensors are XLATensor — no contamination detected ===")
+
 
 def _numpy_to_torch(array: np.ndarray) -> torch.Tensor:
     try:
@@ -200,6 +292,14 @@ class _VllmRunner(torch.nn.Module):
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        # --- Diagnostic: log tensor types before the call that errors ---
+        _log_mixed_tensor_diagnostics(
+            model=self.vllm_model,
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+        )
         hidden_state = self.vllm_model(input_ids, positions,
                                        intermediate_tensors, inputs_embeds)
         return hidden_state
@@ -386,12 +486,26 @@ class VllmModelWrapper:
                 torch_inputs_embeds = None
                 if input_embeds is not None:
                     torch_inputs_embeds = torch_view(input_embeds)
+                # --- Diagnostic: log params_and_buffers + model attrs
+                #     BEFORE functional_call to catch contamination at the
+                #     step_fun / JIT boundary ---
+                _torch_input_ids = torch_view(input_ids)
+                _torch_positions = torch_view(input_positions)
+                _torch_params = torch_view(params_and_buffers)
+                _log_mixed_tensor_diagnostics(
+                    model=self.model,
+                    input_ids=_torch_input_ids,
+                    positions=_torch_positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=torch_inputs_embeds,
+                    params_and_buffers=_torch_params,
+                )
                 output_from_torch = torch.func.functional_call(
                     self.model,
-                    torch_view(params_and_buffers),
+                    _torch_params,
                     kwargs={
-                        "input_ids": torch_view(input_ids),
-                        "positions": torch_view(input_positions),
+                        "input_ids": _torch_input_ids,
+                        "positions": _torch_positions,
                         "intermediate_tensors": intermediate_tensors,
                         "inputs_embeds": torch_inputs_embeds,
                     },
