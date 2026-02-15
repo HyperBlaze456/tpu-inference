@@ -69,6 +69,10 @@ class _VllmRunner(torch.nn.Module):
         self.vllm_model = vllm_model
         embed_input_ids_sig = inspect.signature(self.vllm_model.embed_input_ids)
         self._supports_is_multimodal = "is_multimodal" in embed_input_ids_sig.parameters
+        # Deep stack models (e.g. Qwen3-VL) expect multimodal_embeddings as a
+        # sequence of tensors for torch.cat, not a single tensor.
+        self._needs_tuple_embeddings = hasattr(
+            vllm_model, '_compute_deepstack_embeds')
 
         has_pooler = is_pooling_model(vllm_model)
         self.pooler = vllm_model.pooler if has_pooler else None
@@ -111,6 +115,8 @@ class _VllmRunner(torch.nn.Module):
                         **kwargs) -> torch.Tensor:
         if not self._supports_is_multimodal:
             kwargs.pop("is_multimodal", None)
+        if self._needs_tuple_embeddings and multimodal_embeddings is not None:
+            multimodal_embeddings = (multimodal_embeddings,)
         return self.vllm_model.embed_input_ids(input_ids,
                                                multimodal_embeddings,
                                                **kwargs)
