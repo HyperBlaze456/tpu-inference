@@ -31,7 +31,7 @@ from tpu_inference.layers.jax.sample.sampling_metadata import \
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
-from tpu_inference.utils import device_array
+from tpu_inference.utils import device_array, to_jax_dtype
 
 if TYPE_CHECKING:
     from tpu_inference.runner.tpu_runner import TPUModelRunner
@@ -58,6 +58,7 @@ class CompilationManager:
                              dtype: Any,
                              sharding: Optional[NamedSharding] = None) -> Any:
         """Helper to create dummy tensors for precompilation."""
+        dtype = to_jax_dtype(dtype)
         tensor = jnp.ones(shape, dtype=dtype)
         if sharding:
             return device_array(self.runner.mesh, tensor, sharding=sharding)
@@ -88,8 +89,9 @@ class CompilationManager:
         with self.runner.maybe_setup_dummy_loras(self.runner.lora_config):
             self._precompile_backbone_text_only()
             if self.runner.is_multimodal_model:
-                self.runner.precompile_vision_encoder_fn(
-                    self._run_compilation, )
+                if self.runner.precompile_vision_encoder_fn is not None:
+                    self.runner.precompile_vision_encoder_fn(
+                        self._run_compilation, )
                 self._precompile_input_embeddings_merger()
                 self._precompile_backbone_with_inputs_embeds()
             if self.runner.scheduler_config.async_scheduling:
@@ -123,6 +125,8 @@ class CompilationManager:
                 sharding=sharding)
             dummy_input_ids = self._create_dummy_tensor((num_tokens, ),
                                                         jnp.int32)
+            dummy_is_multimodal = self._create_dummy_tensor((num_tokens, ),
+                                                            jnp.bool_)
 
             self._run_compilation(
                 "input_embeddings_merger",
@@ -130,6 +134,7 @@ class CompilationManager:
                 self.runner.state,
                 dummy_input_ids,
                 dummy_multimodal_embeddings,
+                dummy_is_multimodal,
                 num_tokens=num_tokens,
             )
 
@@ -138,6 +143,7 @@ class CompilationManager:
                 self.runner.embed_input_ids_fn,
                 self.runner.state,
                 dummy_input_ids,
+                None,
                 None,
                 num_tokens=num_tokens,
             )

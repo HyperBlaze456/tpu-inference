@@ -752,7 +752,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # Run the multimodal encoder if any.
             # We have the modality embeds at this time.
             self.mm_manager.execute_mm_encoder(scheduler_output)
-            mm_embeds = self.mm_manager.gather_mm_embeddings(
+            mm_embeds, is_multimodal = self.mm_manager.gather_mm_embeddings(
                 scheduler_output, input_ids.shape[0])
         #TODO: Remove the follow elif statement once Llama Guard 4 Vision portion has been implemented
         elif is_llama_guard_4 and any(
@@ -763,6 +763,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 "Multimodal processing not yet implemented.")
         else:
             mm_embeds = []
+            is_multimodal = None
 
         # NOTE(Wenlong): For multi-modal model,
         # it will embed the text tokens and merge with the existing modality embeds
@@ -770,7 +771,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # For text-only model, this does nothing. It will input the input_ids and
         # leave the mebedding job inside the forward pass
         input_ids, inputs_embeds = self._get_input_ids_embeds(
-            input_ids, mm_embeds)
+            input_ids, mm_embeds, is_multimodal)
 
         lora_metadata = self.lora_utils.extract_lora_metadata()
         # TODO: make _get_input_ids_embeds within this context
@@ -1721,13 +1722,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 logits_indices, spec_decode_metadata, logits_indices_selector,
                 padded_num_reqs)
 
-    def _get_input_ids_embeds(self, input_ids: jax.Array,
-                              mm_embeds: list[jax.Array]):
+    def _get_input_ids_embeds(self, input_ids: jax.Array, mm_embeds,
+                              is_multimodal: jax.Array | None):
         if self.is_multimodal_model:
             inputs_embeds = self.embed_input_ids_fn(
                 self.state,
                 input_ids,
                 mm_embeds,
+                is_multimodal,
             )
             return None, inputs_embeds
         else:

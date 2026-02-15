@@ -165,9 +165,12 @@ class MultiModalManager:
 
             self.runner.encoder_cache[mm_hash] = output
 
-    def gather_mm_embeddings(self, scheduler_output: "VllmSchedulerOutput",
-                             target_pad_len: int) -> list[jax.Array]:
+    def gather_mm_embeddings(
+            self, scheduler_output: "VllmSchedulerOutput", target_pad_len: int
+    ) -> tuple[jax.Array | None, jax.Array | None]:
         mm_embeds: list[jax.Array] = []
+        is_multimodal = jnp.zeros((target_pad_len, ), dtype=jnp.bool_)
+        token_offset = 0
         for req_id in self.runner.input_batch.req_ids:
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[
                 req_id]
@@ -196,6 +199,8 @@ class MultiModalManager:
                     num_computed_tokens - start_pos + num_scheduled_tokens,
                     num_encoder_tokens)
                 assert start_idx < end_idx
+                local_start = max(start_pos - num_computed_tokens, 0)
+                local_end = local_start + (end_idx - start_idx)
                 curr_embeds_start, curr_embeds_end = (
                     pos_info.get_embeds_indices_in_range(start_idx, end_idx))
                 if curr_embeds_start == curr_embeds_end:
@@ -208,22 +213,30 @@ class MultiModalManager:
                 encoder_output = self.runner.encoder_cache[mm_hash]
 
                 if (is_embed := pos_info.is_embed) is not None:
-                    is_embed = is_embed[start_idx:end_idx]
+                    is_embed = jnp.array(is_embed[start_idx:end_idx],
+                                         dtype=jnp.bool_)
                     mm_embeds_item = encoder_output[
                         curr_embeds_start:curr_embeds_end]
+                    is_multimodal = is_multimodal.at[token_offset + local_start:
+                                                     token_offset + local_end].set(
+                                                         is_embed)
                 else:
                     mm_embeds_item = encoder_output[start_idx:end_idx]
+                    is_multimodal = is_multimodal.at[token_offset + local_start:
+                                                     token_offset + local_end].set(
+                                                         True)
 
                 mm_embeds.append(mm_embeds_item)
+            token_offset += num_scheduled_tokens
         if not mm_embeds:
-            return None
+            return None, None
         flattened_embeds = flatten_embeddings(mm_embeds)
         if flattened_embeds.shape[0] == 0:
-            return None
+            return None, None
 
         padding = jnp.zeros((target_pad_len - flattened_embeds.shape[0],
                              flattened_embeds.shape[1]),
                             dtype=flattened_embeds.dtype)
         flattened_embeds = jnp.concatenate([flattened_embeds, padding], axis=0)
 
-        return flattened_embeds
+        return flattened_embeds, is_multimodal

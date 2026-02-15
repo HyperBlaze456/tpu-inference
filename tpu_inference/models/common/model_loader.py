@@ -24,6 +24,7 @@ from vllm.config import VllmConfig
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.runai_streamer_loader import \
     RunaiModelStreamerLoader
+from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.utils.func_utils import supports_kw
 
 from tpu_inference import envs
@@ -368,12 +369,21 @@ def get_vllm_model(
     )
     params, lora_manager = model.load_weights()
 
+    multimodal_fns = None
+    if isinstance(model.model.vllm_model, SupportsMultiModal):
+        multimodal_fns = {
+            "precompile_vision_encoder_fn": None,  # vLLM models don't have this
+            "embed_multimodal_fn": model.make_embed_multimodal_fn(),
+            "embed_input_ids_fn": model.make_embed_input_ids_fn(),
+            "get_mrope_input_positions_fn": model.make_get_mrope_input_positions_fn(),
+        }
+
     jit_model = model.jit_step_func()
     compute_logits_fn = model.jit_compute_logits_func()
     pooler_fn = model.build_pooler_func()
     # the model needs to be returned because lora weights are neither torch.nn.parameter nor torch.nn.buffer. After we load the lora weights and set it to the torch.nn.Module, we can shard it and move it to TPU.
     combine_hidden_states_fn = None
-    return jit_model, compute_logits_fn, pooler_fn, combine_hidden_states_fn, None, params, lora_manager, model
+    return jit_model, compute_logits_fn, pooler_fn, combine_hidden_states_fn, multimodal_fns, params, lora_manager, model
 
 
 def get_model(

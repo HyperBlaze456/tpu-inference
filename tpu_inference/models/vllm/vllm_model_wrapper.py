@@ -14,6 +14,7 @@
 
 import copy
 import functools
+import inspect
 import time
 from collections.abc import Sequence
 from contextlib import nullcontext
@@ -21,6 +22,7 @@ from typing import Any, List, Optional, Tuple
 from unittest.mock import patch
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import torch
 import torch.nn
@@ -65,11 +67,19 @@ class _VllmRunner(torch.nn.Module):
     def __init__(self, vllm_model: torch.nn.Module):
         super().__init__()
         self.vllm_model = vllm_model
+        embed_input_ids_sig = inspect.signature(self.vllm_model.embed_input_ids)
+        self._supports_is_multimodal = "is_multimodal" in embed_input_ids_sig.parameters
 
         has_pooler = is_pooling_model(vllm_model)
         self.pooler = vllm_model.pooler if has_pooler else None
 
     def forward(self, **kwargs) -> torch.Tensor:
+        if "_dispatch" in kwargs:
+            dispatch = kwargs.pop("_dispatch")
+            if dispatch == "embed_multimodal":
+                return self.embed_multimodal(**kwargs)
+            elif dispatch == "embed_input_ids":
+                return self.embed_input_ids(**kwargs)
         if "hidden_state" in kwargs:
             return self.compute_logits(kwargs["hidden_state"])
         else:
@@ -93,6 +103,17 @@ class _VllmRunner(torch.nn.Module):
 
     def compute_logits(self, hidden_state: torch.Tensor) -> torch.Tensor:
         return self.vllm_model.compute_logits(hidden_state)
+
+    def embed_multimodal(self, **kwargs) -> Any:
+        return self.vllm_model.embed_multimodal(**kwargs)
+
+    def embed_input_ids(self, input_ids, multimodal_embeddings=None,
+                        **kwargs) -> torch.Tensor:
+        if not self._supports_is_multimodal:
+            kwargs.pop("is_multimodal", None)
+        return self.vllm_model.embed_input_ids(input_ids,
+                                               multimodal_embeddings,
+                                               **kwargs)
 
 
 class VllmModelWrapper:
@@ -260,10 +281,10 @@ class VllmModelWrapper:
                     self.model,
                     torch_view(params_and_buffers),
                     kwargs={
-                        "input_ids": torch_view(input_ids),
+                        "input_ids": None if input_embeds is not None else torch_view(input_ids),
                         "positions": torch_view(input_positions),
                         "intermediate_tensors": intermediate_tensors,
-                        "inputs_embeds": None,
+                        "inputs_embeds": torch_view(input_embeds) if input_embeds is not None else None,
                     },
                     tie_weights=False,
                 )
@@ -313,6 +334,92 @@ class VllmModelWrapper:
             return jax_view(logits)
 
         return compute_logits_func
+
+    def make_embed_multimodal_fn(self):
+
+        def embed_multimodal_fn(state, image_grid_thw,
+                                **kwargs) -> tuple[jax.Array, ...]:
+            converted_kwargs = {
+                k: torch_view(jnp.array(v)) if isinstance(v, np.ndarray) else v
+                for k, v in kwargs.items()
+            }
+            with torchax.default_env(), set_forward_context(
+                    attn_metadata=None, vllm_config=self.vllm_config):
+                output = torch.func.functional_call(
+                    self.model,
+                    torch_view(state),
+                    kwargs={
+                        "_dispatch": "embed_multimodal",
+                        "image_grid_thw": image_grid_thw,
+                        **converted_kwargs,
+                    },
+                    tie_weights=False,
+                )
+
+            if isinstance(output, (list, tuple)):
+                return tuple(jax_view(t) for t in output)
+            return (jax_view(output), )
+
+        return embed_multimodal_fn
+
+    def make_embed_input_ids_fn(self):
+
+        @jax.jit
+        def embed_input_ids_fn(state, input_ids,
+                               multimodal_embeddings,
+                               is_multimodal) -> jax.Array:
+            with torchax.default_env():
+                output = torch.func.functional_call(
+                    self.model,
+                    torch_view(state),
+                    kwargs={
+                        "_dispatch": "embed_input_ids",
+                        "input_ids": torch_view(input_ids),
+                        "multimodal_embeddings": torch_view(
+                            multimodal_embeddings)
+                        if multimodal_embeddings is not None else None,
+                        "is_multimodal": torch_view(is_multimodal)
+                        if is_multimodal is not None else None,
+                    },
+                    tie_weights=False,
+                )
+            return jax_view(output)
+
+        return embed_input_ids_fn
+
+    def make_get_mrope_input_positions_fn(self):
+        if not hasattr(self.model.vllm_model, "get_mrope_input_positions"):
+            return None
+
+        get_mrope_input_positions = self.model.vllm_model.get_mrope_input_positions
+
+        def _to_jax_array(value: Any) -> jax.Array:
+            if isinstance(value, jax.Array):
+                return value
+            if isinstance(value, torch.Tensor):
+                return jax_view(value)
+            return jnp.array(value)
+
+        def get_mrope_input_positions_fn(*args, **kwargs):
+            if args:
+                input_tokens = args[0]
+                mm_features = args[1] if len(args) > 1 else kwargs.pop(
+                    "mm_features", None)
+            else:
+                input_tokens = kwargs.pop("input_tokens")
+                mm_features = kwargs.pop("mm_features", None)
+
+            if mm_features is None:
+                mm_features = kwargs
+            elif kwargs:
+                mm_features = {**mm_features, **kwargs}
+
+            positions, mrope_position_delta = get_mrope_input_positions(
+                input_tokens, mm_features)
+            return _to_jax_array(positions), _to_jax_array(
+                mrope_position_delta)
+
+        return get_mrope_input_positions_fn
 
     def build_pooler_func(self) -> PoolerFunc:
 
