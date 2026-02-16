@@ -114,10 +114,31 @@ class CompilationManager:
             if self.runner.speculative_config:
                 self._precompile_speculative_decoding()
 
+    def _get_mm_embedding_hidden_size(self) -> int:
+        """Get the hidden size of multimodal embeddings from the vision encoder.
+
+        For deep stack models (e.g. Qwen3-VL), the vision encoder concatenates
+        intermediate layer features along the hidden dimension, producing
+        out_hidden_size * (1 + num_deepstack_layers). Falls back to the LLM
+        hidden size when vision config is unavailable.
+        """
+        hidden_size = self.runner.vllm_config.model_config.get_hidden_size()
+        hf_config = getattr(self.runner.model_config, 'hf_config', None)
+        if hf_config is None:
+            return hidden_size
+        vision_config = getattr(hf_config, 'vision_config', None)
+        if vision_config is None:
+            return hidden_size
+        out_hidden_size = getattr(vision_config, 'out_hidden_size', None)
+        if out_hidden_size is None:
+            return hidden_size
+        deepstack_indexes = getattr(vision_config,
+                                    'deepstack_visual_indexes', [])
+        return out_hidden_size * (1 + len(deepstack_indexes))
+
     def _precompile_input_embeddings_merger(self) -> None:
         for num_tokens in self.runner.num_tokens_paddings:
-            hidden_size = self.runner.vllm_config.model_config.get_hidden_size(
-            )
+            hidden_size = self._get_mm_embedding_hidden_size()
             sharding = NamedSharding(self.runner.mesh, PartitionSpec())
             dummy_multimodal_embeddings = self._create_dummy_tensor(
                 (num_tokens, hidden_size),
