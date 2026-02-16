@@ -137,6 +137,7 @@ class VllmModelWrapper:
         self.vllm_config.quant_config = get_tpu_quantization_config(
             self.vllm_config, self.mesh)
         self._apply_pp_patch()
+        self._apply_mm_merge_patch()
 
     def _apply_pp_patch(self):
         # patch `get_pp_group` in vLLM to jax's get_pp_group.
@@ -152,6 +153,56 @@ class VllmModelWrapper:
             if module_name.startswith("vllm.model_executor.models"):
                 if hasattr(module, "get_pp_group"):
                     setattr(module, "get_pp_group", jax_get_pp_group)
+
+    def _apply_mm_merge_patch(self):
+        """Patch vLLM's _merge_multimodal_embeddings for JIT compatibility.
+
+        vLLM's version uses masked_scatter_ which torchax implements via
+        jnp.nonzero — a data-dependent-shape op forbidden inside jax.jit.
+        This replaces it with cumsum + gather + 3-arg where, matching the
+        algorithm already used in tpu_inference's JAX multi_modal_utils.
+        """
+        import sys
+
+        import vllm.model_executor.models.utils as vllm_model_utils
+
+        _flatten = vllm_model_utils._flatten_embeddings
+
+        def _jit_merge_multimodal_embeddings(inputs_embeds,
+                                             multimodal_embeddings,
+                                             is_multimodal):
+            if len(multimodal_embeddings) == 0:
+                return inputs_embeds
+
+            mm_embeds_flat = _flatten(multimodal_embeddings)
+
+            # Build padded array: [dummy_row, emb_0, emb_1, ..., emb_N]
+            # so that index 0 maps to a zero row (for non-multimodal tokens)
+            # and cumsum of is_multimodal gives 1-based indices into the
+            # real embeddings.
+            dummy_row = torch.zeros_like(mm_embeds_flat[0:1])
+            padded = torch.cat([dummy_row, mm_embeds_flat], dim=0)
+
+            gather_indices = torch.cumsum(is_multimodal.to(torch.int32),
+                                          dim=0)
+            update_values = padded[gather_indices]
+
+            return torch.where(
+                is_multimodal.unsqueeze(-1),
+                update_values.to(dtype=inputs_embeds.dtype),
+                inputs_embeds,
+            )
+
+        # Patch at the source module so future imports pick it up.
+        vllm_model_utils._merge_multimodal_embeddings = (
+            _jit_merge_multimodal_embeddings)
+
+        # Safety net: also patch any model modules that already imported it.
+        for module_name, module in sys.modules.items():
+            if module_name.startswith("vllm.model_executor.models"):
+                if hasattr(module, "_merge_multimodal_embeddings"):
+                    setattr(module, "_merge_multimodal_embeddings",
+                            _jit_merge_multimodal_embeddings)
 
     def load_weights(self):
         loading_start = time.time()
