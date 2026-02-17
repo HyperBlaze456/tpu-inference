@@ -467,6 +467,11 @@ class VllmModelWrapper:
                 k: torch_view(jnp.array(v)) if isinstance(v, np.ndarray) else v
                 for k, v in kwargs.items()
             }
+            # Convert tuple back to torchax tensor for vllm models that assert grid_thw.ndim == 2. The tuple form is used upstream for JIT hashability.
+            # This might be required change in the vllm, as grid_thw does not really need to be tensors.
+            if isinstance(image_grid_thw, tuple) and image_grid_thw:
+                image_grid_thw = torch_view(
+                    jnp.array(image_grid_thw, dtype=jnp.int32))
             with torchax.default_env(), set_forward_context(
                     attn_metadata=None, vllm_config=self.vllm_config):
                 output = torch.func.functional_call(
