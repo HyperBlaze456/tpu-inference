@@ -179,6 +179,7 @@ class PersistentBatchManager:
                 self.requests[req_id].mrope_positions, self.requests[
                     req_id].mrope_position_delta = get_mrope_input_positions_fn(
                         self.requests[req_id].prompt_token_ids,
+                        mm_features=self.requests[req_id].mm_features,
                         hf_config=hf_config,
                         image_grid_thw=image_grid_thw,
                         video_grid_thw=video_grid_thw,

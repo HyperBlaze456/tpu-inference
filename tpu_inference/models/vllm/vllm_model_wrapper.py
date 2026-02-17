@@ -539,11 +539,6 @@ class VllmModelWrapper:
                 input_tokens = kwargs.pop("input_tokens")
                 mm_features = kwargs.pop("mm_features", None)
 
-            if mm_features is None:
-                mm_features = kwargs
-            elif kwargs:
-                mm_features = {**mm_features, **kwargs}
-
             positions, mrope_position_delta = get_mrope_input_positions(
                 input_tokens, mm_features)
             return _to_jax_array(positions), _to_jax_array(

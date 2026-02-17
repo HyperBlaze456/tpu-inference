@@ -793,6 +793,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         seq_len: int | None = None,
         audio_feature_lengths=None,
         use_audio_in_video: bool = False,
+        mm_features=None,
     ) -> tuple[jax.Array, int]:
         """Get mrope input positions and delta value."""
 
