@@ -182,7 +182,11 @@ class CompilationManager:
         if input_ids is not None:
             num_tokens = input_ids.shape[0]
         elif inputs_embeds is not None:
-            num_tokens = inputs_embeds.shape[0]
+            # For deepstack models inputs_embeds is 3-D:
+            # (1 + num_level, num_tokens, hidden_size).
+            num_tokens = (inputs_embeds.shape[-2]
+                          if inputs_embeds.ndim == 3
+                          else inputs_embeds.shape[0])
         assert num_tokens is not None
 
         dp_size = self.runner.vllm_config.sharding_config.total_dp_size
@@ -362,12 +366,32 @@ class CompilationManager:
                 is_first_rank=is_first_rank,
                 is_last_rank=is_last_rank)
 
+    def _get_deepstack_num_level(self) -> int:
+        """Return the number of deepstack levels, or 0 if not a deepstack model."""
+        model = getattr(self.runner, 'model', None)
+        if model is None:
+            return 0
+        runner_model = getattr(model, 'model', None)
+        if runner_model is None:
+            return 0
+        if getattr(runner_model, '_has_deepstack', False):
+            return runner_model._deepstack_num_level
+        return 0
+
     def _precompile_backbone_with_inputs_embeds(self) -> None:
         hidden_size = self.runner.model_config.get_hidden_size()
         dtype = self.runner.model_config.dtype
+        deepstack_num_level = self._get_deepstack_num_level()
         for num_tokens in self.runner.num_tokens_paddings:
-            inputs_embeds = self._create_dummy_tensor(
-                (num_tokens, hidden_size), dtype)
+            if deepstack_num_level > 0:
+                # Deepstack models receive a 3-D tensor:
+                # (1 + num_level, num_tokens, hidden_size)
+                # TODO: This might break in certain deepstack logic. Multimodal models must be checked when it is added by pytorch vllm.
+                inputs_embeds = self._create_dummy_tensor(
+                    (1 + deepstack_num_level, num_tokens, hidden_size), dtype)
+            else:
+                inputs_embeds = self._create_dummy_tensor(
+                    (num_tokens, hidden_size), dtype)
             if self.runner.uses_mrope:
                 positions = self._create_dummy_tensor((3, num_tokens),
                                                       jnp.int32)

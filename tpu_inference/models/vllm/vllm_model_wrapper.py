@@ -73,9 +73,40 @@ class _VllmRunner(torch.nn.Module):
         # sequence of tensors for torch.cat, not a single tensor.
         self._needs_tuple_embeddings = hasattr(
             vllm_model, '_compute_deepstack_embeds')
+        # Detect deepstack (Qwen3-VL, Qwen3-Omni, InternS1-Pro).
+        self._has_deepstack = (
+            getattr(vllm_model, 'use_deepstack', False)
+            and getattr(vllm_model, 'deepstack_num_level', 0) > 0)
+        self._deepstack_num_level = getattr(
+            vllm_model, 'deepstack_num_level', 0)
+        if self._has_deepstack:
+            self._patch_deepstack_for_tpu()
 
         has_pooler = is_pooling_model(vllm_model)
         self.pooler = vllm_model.pooler if has_pooler else None
+
+    def _patch_deepstack_for_tpu(self):
+        """Patch deepstack methods for JIT compatibility.
+
+        vLLM's deepstack uses mutable buffer side-channels
+        (self.deepstack_input_embeds list with .copy_()) that are
+        incompatible with @jax.jit. We replace:
+        - _set_deepstack_input_embeds: captures tensor via attribute
+          instead of .copy_() into pre-allocated buffers.
+        - _clear_deepstack_input_embeds: no-op (buffer not used).
+
+        This logic applies to every deepstack model (Qwen3 VL / Omni, Interns1-pro)
+        """
+        model = self.vllm_model
+        model._tpu_captured_deepstack = None
+
+        def _capture_set(deepstack_input_embeds):
+            model._tpu_captured_deepstack = deepstack_input_embeds
+
+        model._set_deepstack_input_embeds = _capture_set
+
+        if hasattr(model, '_clear_deepstack_input_embeds'):
+            model._clear_deepstack_input_embeds = lambda *args, **kwargs: None
 
     def forward(self, **kwargs) -> torch.Tensor:
         if "_dispatch" in kwargs:
@@ -101,6 +132,33 @@ class _VllmRunner(torch.nn.Module):
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        if (self._has_deepstack
+                and inputs_embeds is not None
+                and inputs_embeds.dim() == 3):
+            # inputs_embeds is (1 + num_level, num_tokens, hidden_size)
+            # produced by concatenating [inputs_embeds, deepstack] in
+            # _get_input_ids_embeds.  Split them back here.
+            actual_embeds = inputs_embeds[0]     # (num_tokens, hidden_size)
+            deepstack = inputs_embeds[1:]        # (num_level, num_tokens, H)
+
+            num_levels = self._deepstack_num_level
+
+            def _functional_get(num_tokens):
+                return IntermediateTensors({
+                    f"deepstack_input_embeds_{idx}":
+                        deepstack[idx][:num_tokens]
+                    for idx in range(num_levels)
+                })
+
+            orig_get = self.vllm_model._get_deepstack_input_embeds
+            self.vllm_model._get_deepstack_input_embeds = _functional_get
+
+            hidden_state = self.vllm_model(
+                input_ids, positions, intermediate_tensors, actual_embeds)
+
+            self.vllm_model._get_deepstack_input_embeds = orig_get
+            return hidden_state
+
         hidden_state = self.vllm_model(input_ids, positions,
                                        intermediate_tensors, inputs_embeds)
         return hidden_state
@@ -112,14 +170,23 @@ class _VllmRunner(torch.nn.Module):
         return self.vllm_model.embed_multimodal(**kwargs)
 
     def embed_input_ids(self, input_ids, multimodal_embeddings=None,
-                        **kwargs) -> torch.Tensor:
+                        **kwargs):
         if not self._supports_is_multimodal:
             kwargs.pop("is_multimodal", None)
         if self._needs_tuple_embeddings and multimodal_embeddings is not None:
             multimodal_embeddings = (multimodal_embeddings,)
-        return self.vllm_model.embed_input_ids(input_ids,
-                                               multimodal_embeddings,
-                                               **kwargs)
+
+        inputs_embeds = self.vllm_model.embed_input_ids(
+            input_ids, multimodal_embeddings, **kwargs)
+
+        if self._has_deepstack:
+            # _set_deepstack_input_embeds was patched to capture here
+            # instead of .copy_() into a buffer.
+            deepstack = self.vllm_model._tpu_captured_deepstack
+            self.vllm_model._tpu_captured_deepstack = None
+            return inputs_embeds, deepstack
+
+        return inputs_embeds, None
 
 
 class VllmModelWrapper:
@@ -424,7 +491,7 @@ class VllmModelWrapper:
         @jax.jit
         def embed_input_ids_fn(state, input_ids,
                                multimodal_embeddings,
-                               is_multimodal) -> jax.Array:
+                               is_multimodal):
             with torchax.default_env():
                 output = torch.func.functional_call(
                     self.model,
@@ -440,7 +507,13 @@ class VllmModelWrapper:
                     },
                     tie_weights=False,
                 )
-            return jax_view(output)
+            # _VllmRunner.embed_input_ids always returns
+            # (inputs_embeds, deepstack_or_None).
+            inputs_embeds, deepstack = output
+            jax_embeds = jax_view(inputs_embeds)
+            jax_deepstack = (
+                jax_view(deepstack) if deepstack is not None else None)
+            return jax_embeds, jax_deepstack
 
         return embed_input_ids_fn
 

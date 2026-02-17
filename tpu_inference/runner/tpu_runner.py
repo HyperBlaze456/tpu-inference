@@ -1725,12 +1725,28 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
     def _get_input_ids_embeds(self, input_ids: jax.Array, mm_embeds,
                               is_multimodal: jax.Array | None):
         if self.is_multimodal_model:
-            inputs_embeds = self.embed_input_ids_fn(
+            result = self.embed_input_ids_fn(
                 self.state,
                 input_ids,
                 mm_embeds,
                 is_multimodal,
             )
+            # vLLM embed_input_ids_fn returns (inputs_embeds, deepstack_or_None).
+            # Flax embed_input_ids_fn returns a plain jax.Array.
+            if isinstance(result, tuple):
+                inputs_embeds, deepstack = result
+                if deepstack is not None:
+                    # Pack deepstack with inputs_embeds into a 3-D tensor so
+                    # it flows through the existing step_fun interface
+                    # unchanged.
+                    # Shape: (1 + num_level, num_tokens, hidden_size)
+                    # TODO: This might break in certain deepstack logic. Multimodal models must be checked when it is added by pytorch vllm.
+                    inputs_embeds = jnp.concatenate(
+                        [jnp.expand_dims(inputs_embeds, axis=0), deepstack],
+                        axis=0,
+                    )
+            else:
+                inputs_embeds = result
             return None, inputs_embeds
         else:
             return input_ids, None
