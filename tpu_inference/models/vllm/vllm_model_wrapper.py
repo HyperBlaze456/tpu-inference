@@ -205,6 +205,44 @@ class VllmModelWrapper:
             self.vllm_config, self.mesh)
         self._apply_pp_patch()
         self._apply_mm_merge_patch()
+        self._apply_vision_rotary_patch()
+
+    def _apply_vision_rotary_patch(self):
+        """Patch RotaryEmbedding.get_cos_sin for TPU compatibility.
+
+        vLLM's RotaryEmbedding.get_cos_sin() slices cos_sin_cache[:seqlen].
+        When the cache is a torchax tensor backed by a JAX array on TPU,
+        the slice triggers recursive JAX JIT calls through torchax's View
+        mechanism (View.__new__ -> calculate_output_shape -> JAX slice ->
+        device_put -> jit -> device_put -> jit -> RecursionError).
+
+        This patch routes the slice through numpy to avoid the recursion. The improved logic / not caching at all
+        should be considered, imo. This should be implemented in the vllm part ideally, instead of patching at here.
+        """
+        from vllm.model_executor.layers.rotary_embedding.base import (
+            RotaryEmbedding)
+
+        original_get_cos_sin = RotaryEmbedding.get_cos_sin
+
+        def _tpu_get_cos_sin(rope_self, seqlen):
+            cache = rope_self.cos_sin_cache
+            try:
+                jax_cache = jax_view(cache)
+            except Exception:
+                # Not a torchax tensor (e.g. during CPU model loading).
+                return original_get_cos_sin(rope_self, seqlen)
+
+            original_dtype = jax_cache.dtype
+            cache_np = np.asarray(jax_cache)
+            sliced = cache_np[:seqlen]
+            sliced_jax = jnp.asarray(sliced)
+            if sliced_jax.dtype != original_dtype:
+                sliced_jax = sliced_jax.astype(original_dtype)
+            cos_sin = torch_view(sliced_jax)
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            return cos, sin
+
+        RotaryEmbedding.get_cos_sin = _tpu_get_cos_sin
 
     def _apply_pp_patch(self):
         # patch `get_pp_group` in vLLM to jax's get_pp_group.
