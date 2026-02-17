@@ -527,7 +527,8 @@ class VllmModelWrapper:
             if isinstance(value, jax.Array):
                 return value
             if isinstance(value, torch.Tensor):
-                return jax_view(value)
+                # jax_view failed to deal with torch.Tensor properly.
+                return jnp.array(value.detach().cpu().numpy())
             return jnp.array(value)
 
         def get_mrope_input_positions_fn(*args, **kwargs):
