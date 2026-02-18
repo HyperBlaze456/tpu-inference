@@ -94,6 +94,11 @@ class _VllmRunner(torch.nn.Module):
         - _set_deepstack_input_embeds: captures tensor via attribute
           instead of .copy_() into pre-allocated buffers.
         - _clear_deepstack_input_embeds: no-op (buffer not used).
+        - _get_deepstack_input_embeds: returns None so the pre-allocated
+          plain torch.Tensor buffers are never mixed with XLA tensors.
+          The real deepstack data flows through compute_hidden_state()
+          which packs it into inputs_embeds and unpacks via a temporary
+          _functional_get override.
 
         This logic applies to every deepstack model (Qwen3 VL / Omni, Interns1-pro)
         """
@@ -107,6 +112,14 @@ class _VllmRunner(torch.nn.Module):
 
         if hasattr(model, '_clear_deepstack_input_embeds'):
             model._clear_deepstack_input_embeds = lambda *args, **kwargs: None
+
+        # Neutralize _get_deepstack_input_embeds so the pre-allocated
+        # torch.Tensor buffers (self.deepstack_input_embeds) are never
+        # returned inside a JIT context. For multimodal inputs,
+        # compute_hidden_state() temporarily overrides this with a
+        # _functional_get that returns proper XLA tensors.
+        if hasattr(model, '_get_deepstack_input_embeds'):
+            model._get_deepstack_input_embeds = lambda num_tokens: None
 
     def forward(self, **kwargs) -> torch.Tensor:
         if "_dispatch" in kwargs:
