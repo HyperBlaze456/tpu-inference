@@ -219,6 +219,7 @@ class VllmModelWrapper:
         self._apply_pp_patch()
         self._apply_mm_merge_patch()
         self._apply_vision_rotary_patch()
+        self._apply_vision_attn_patch()
 
     def _apply_vision_rotary_patch(self):
         """Patch RotaryEmbedding.get_cos_sin for TPU compatibility.
@@ -256,6 +257,45 @@ class VllmModelWrapper:
             return cos, sin
 
         RotaryEmbedding.get_cos_sin = _tpu_get_cos_sin
+
+    def _apply_vision_attn_patch(self):
+        """Patch vLLM's vision encoder attention for torchax compatibility.
+
+        vLLM wraps SDPA / Flash-Attention calls in custom ops
+        (torch.ops.vllm.torch_sdpa_wrapper, etc.) registered under the
+        ``vllm`` namespace.  torchax's XLADispatchMode only intercepts
+        ops in whitelisted namespaces (aten, xla, …) and lets ``vllm``-
+        namespace ops fall through, which ultimately hits the torchax
+        Tensor-level __torch_dispatch__ that raises AssertionError.
+
+        We replace the thin wrapper functions that call these custom ops
+        with direct calls to the underlying Python implementations, which
+        use only standard PyTorch ops that torchax *can* handle.
+        """
+        import sys
+
+        try:
+            import vllm.v1.attention.ops.vit_attn_wrappers as vit_ops
+            import vllm.model_executor.layers.attention.mm_encoder_attention \
+                as mm_attn
+        except ImportError:
+            return  # vLLM version without these modules
+
+        # The underlying implementations use only standard PyTorch ops.
+        raw_sdpa = vit_ops.torch_sdpa_wrapper
+
+        # Patch at the source module.
+        vit_ops.vit_torch_sdpa_wrapper = raw_sdpa
+
+        # Also patch the already-imported reference in mm_encoder_attention.
+        if hasattr(mm_attn, 'vit_torch_sdpa_wrapper'):
+            mm_attn.vit_torch_sdpa_wrapper = raw_sdpa
+
+        # Safety net: patch any model modules that already imported it.
+        for module_name, module in sys.modules.items():
+            if module_name.startswith("vllm."):
+                if hasattr(module, "vit_torch_sdpa_wrapper"):
+                    setattr(module, "vit_torch_sdpa_wrapper", raw_sdpa)
 
     def _apply_pp_patch(self):
         # patch `get_pp_group` in vLLM to jax's get_pp_group.

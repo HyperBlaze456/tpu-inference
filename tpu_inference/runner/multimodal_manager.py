@@ -137,7 +137,7 @@ class MultiModalManager:
                             torch.float32).numpy().astype(jnp.bfloat16)
                     else:
                         batched_mm_inputs[key] = value.numpy()
-            batched_mm_inputs.pop('image_grid_thw')
+            batched_mm_inputs.pop('image_grid_thw', None)
 
             # Run the encoder.
             # `curr_group_outputs` is either of the following:
