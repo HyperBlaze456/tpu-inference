@@ -16,67 +16,16 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.multimodal.inputs import MultiModalKwargsItem, PlaceholderRange
 from vllm.multimodal.utils import group_mm_kwargs_by_modality
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
 from tpu_inference.models.jax.utils.multi_modal_utils import (
-    flatten_embeddings, gather_mm_placeholders, sanity_check_mm_encoder_outputs,
-    scatter_mm_placeholders)
+    flatten_embeddings, sanity_check_mm_encoder_outputs)
 
 if TYPE_CHECKING:
     from tpu_inference.runner.tpu_runner import TPUModelRunner
-
-
-def _normalize_grid_thw(grid_thw: object) -> tuple[tuple[int, int, int], ...]:
-    """Normalize grid_thw into a tuple-of-tuples, flattening batch dim if present.
-
-    Note: Multimodal processing currently uses a single batch dimension, but
-    sequence-level batching may introduce a leading B dim (B, N, 3). We flatten
-    it here to keep the encoder interface stable.
-    """
-    if grid_thw is None:
-        return ()
-
-    if isinstance(grid_thw, (list, tuple)):
-        if len(grid_thw) == 0:
-            return ()
-        if len(grid_thw) == 3 and all(
-                isinstance(v, (int, np.integer)) for v in grid_thw):
-            return (tuple(int(v) for v in grid_thw), )
-        if all(isinstance(row, (list, tuple)) for row in grid_thw):
-            if grid_thw and grid_thw[0] and isinstance(grid_thw[0][0],
-                                                      (list, tuple)):
-                # Flatten (B, N, 3) -> (B*N, 3)
-                flat_rows = [row for batch in grid_thw for row in batch]
-                return tuple(tuple(int(v) for v in row) for row in flat_rows)
-            return tuple(tuple(int(v) for v in row) for row in grid_thw)
-
-    # Handle torch/jax/numpy tensors.
-    if hasattr(grid_thw, "detach"):
-        grid_thw = grid_thw.detach().cpu()
-    if hasattr(grid_thw, "numpy"):
-        try:
-            grid_thw = grid_thw.numpy()
-        except Exception:
-            pass
-
-    arr = np.asarray(grid_thw)
-    if arr.size == 0:
-        return ()
-    if arr.ndim == 1 and arr.shape[0] == 3:
-        return (tuple(int(v) for v in arr.tolist()), )
-    if arr.ndim == 2 and arr.shape[1] == 3:
-        return tuple(tuple(int(v) for v in row) for row in arr.tolist())
-    if arr.ndim == 3 and arr.shape[2] == 3:
-        flat = arr.reshape(-1, 3)
-        return tuple(tuple(int(v) for v in row) for row in flat.tolist())
-
-    raise ValueError(
-        "Incorrect type/shape of grid_thw. Expected (3,), (N, 3), or (B, N, 3)."
-    )
 
 
 class MultiModalManager:
@@ -141,7 +90,7 @@ class MultiModalManager:
             return
 
         # Batch the multi-modal inputs.
-        mm_kwargs = list[MultiModalKwargsItem]()
+        mm_kwargs = list[tuple[str, MultiModalKwargsItem]]()
         # List of tuple (mm_hash, pos_info)
         mm_hashes_pos = list[tuple[str, PlaceholderRange]]()
         for req_id, encoder_input_ids in scheduled_encoder_inputs.items():
@@ -149,7 +98,7 @@ class MultiModalManager:
             for mm_input_id in encoder_input_ids:
                 mm_feature = req_state.mm_features[mm_input_id]
                 mm_hash = mm_feature.identifier
-                mm_kwargs.append(mm_feature.data)
+                mm_kwargs.append((mm_feature.modality, mm_feature.data))
                 mm_hashes_pos.append((mm_hash, mm_feature.mm_position))
 
         # Batch mm inputs as much as we can: if a request in the batch has
@@ -160,31 +109,36 @@ class MultiModalManager:
         # multimodal inputs. The proper solution should be reordering the
         # encoder outputs.
         encoder_outputs = []
-        deepstack_outputs = None
         for _, num_items, mm_kwargs_group in group_mm_kwargs_by_modality(
                 mm_kwargs):
             batched_mm_inputs = mm_kwargs_group
             # Convert torch tensors to numpy arrays that JAX can handle.
-            for key in ("pixel_values", "pixel_values_videos"):
-                if key in batched_mm_inputs and isinstance(
-                        batched_mm_inputs[key], list):
-                    batched_mm_inputs[key] = torch.cat(
-                        batched_mm_inputs[key], dim=0)
+            if "pixel_values" in batched_mm_inputs and isinstance(
+                    batched_mm_inputs["pixel_values"], list):
+                batched_mm_inputs["pixel_values"] = torch.cat(
+                    batched_mm_inputs["pixel_values"], dim=0)
 
-            image_grid_thw = _normalize_grid_thw(
-                batched_mm_inputs.pop("image_grid_thw", None))
-            video_grid_thw = _normalize_grid_thw(
-                batched_mm_inputs.pop("video_grid_thw", None))
-            if video_grid_thw:
-                batched_mm_inputs["video_grid_thw"] = video_grid_thw
-
+            image_grid_thw = ()
             for key, value in batched_mm_inputs.items():
                 if isinstance(value, torch.Tensor):
+                    if key == 'image_grid_thw':
+                        # change it to tuple of tuples to make it hashable for JIT
+
+                        # Shape: (B, N, 3) -> (B*N, 3) -> tuple of tuples
+                        grid_thw_tensor = batched_mm_inputs[key]
+                        grid_thw_reshaped = grid_thw_tensor.reshape(-1, 3)
+                        image_grid_thw = tuple(
+                            tuple(row) for row in grid_thw_reshaped.tolist())
+
+                        continue
+
                     if value.dtype == torch.bfloat16:
                         batched_mm_inputs[key] = value.to(
                             torch.float32).numpy().astype(jnp.bfloat16)
                     else:
                         batched_mm_inputs[key] = value.numpy()
+            if 'image_grid_thw' in batched_mm_inputs:
+                batched_mm_inputs.pop('image_grid_thw')
 
             # Run the encoder.
             # `curr_group_outputs` is either of the following:
@@ -195,10 +149,6 @@ class MultiModalManager:
             # depending on the input multimodal items.
             curr_group_outputs = self.runner.embed_multimodal_fn(
                 self.runner.state, image_grid_thw, **batched_mm_inputs)
-            deepstack_group_outputs = None
-            if isinstance(curr_group_outputs, dict):
-                deepstack_group_outputs = curr_group_outputs.get("deepstack")
-                curr_group_outputs = curr_group_outputs.get("embeds", ())
 
             sanity_check_mm_encoder_outputs(
                 curr_group_outputs,
@@ -207,52 +157,18 @@ class MultiModalManager:
 
             for output in curr_group_outputs:
                 encoder_outputs.append(output)
-            if deepstack_group_outputs is not None:
-                if len(deepstack_group_outputs) != len(curr_group_outputs):
-                    raise ValueError(
-                        "DeepStack outputs must align with encoder outputs."
-                    )
-                if deepstack_outputs is None:
-                    deepstack_outputs = []
-                deepstack_outputs.extend(deepstack_group_outputs)
-            elif deepstack_outputs is not None:
-                deepstack_outputs.extend([None] * len(curr_group_outputs))
 
         # Cache the encoder outputs.
-        if deepstack_outputs is None:
-            for (mm_hash, pos_info), output in zip(
-                    mm_hashes_pos,
-                    encoder_outputs,
-            ):
-                self.runner.encoder_cache[mm_hash] = scatter_mm_placeholders(
-                    output,
-                    is_embed=pos_info.is_embed,
-                )
-        else:
-            for (mm_hash, pos_info), output, deepstack_output in zip(
-                    mm_hashes_pos,
-                    encoder_outputs,
-                    deepstack_outputs,
-            ):
-                self.runner.encoder_cache[mm_hash] = scatter_mm_placeholders(
-                    output,
-                    is_embed=pos_info.is_embed,
-                )
-                if deepstack_output is not None:
-                    if pos_info.is_embed is not None:
-                        deepstack_output = [
-                            scatter_mm_placeholders(layer_output,
-                                                    is_embed=pos_info.is_embed)
-                            for layer_output in deepstack_output
-                        ]
-                    self.runner.deepstack_cache[mm_hash] = deepstack_output
+        for (mm_hash, _), output in zip(
+                mm_hashes_pos,
+                encoder_outputs,
+        ):
+
+            self.runner.encoder_cache[mm_hash] = output
 
     def gather_mm_embeddings(self, scheduler_output: "VllmSchedulerOutput",
                              target_pad_len: int) -> list[jax.Array]:
         mm_embeds: list[jax.Array] = []
-        deepstack_layers: list[list[jax.Array]] | None = None
-        deepstack_dim = None
-        deepstack_dtype = None
         for req_id in self.runner.input_batch.req_ids:
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[
                 req_id]
@@ -281,6 +197,11 @@ class MultiModalManager:
                     num_computed_tokens - start_pos + num_scheduled_tokens,
                     num_encoder_tokens)
                 assert start_idx < end_idx
+                curr_embeds_start, curr_embeds_end = (
+                    pos_info.get_embeds_indices_in_range(start_idx, end_idx))
+                if curr_embeds_start == curr_embeds_end:
+                    continue
+
                 mm_hash = mm_feature.identifier
                 encoder_output = self.runner.encoder_cache.get(mm_hash, None)
                 assert encoder_output is not None,\
@@ -289,53 +210,21 @@ class MultiModalManager:
 
                 if (is_embed := pos_info.is_embed) is not None:
                     is_embed = is_embed[start_idx:end_idx]
+                    mm_embeds_item = encoder_output[
+                        curr_embeds_start:curr_embeds_end]
+                else:
+                    mm_embeds_item = encoder_output[start_idx:end_idx]
 
-                mm_embeds_item = gather_mm_placeholders(
-                    encoder_output[start_idx:end_idx],
-                    is_embed=is_embed,
-                )
                 mm_embeds.append(mm_embeds_item)
-                deepstack_output = self.runner.deepstack_cache.get(mm_hash)
-                if deepstack_output is not None:
-                    if deepstack_layers is None:
-                        deepstack_dim = deepstack_output[0].shape[1]
-                        deepstack_dtype = deepstack_output[0].dtype
-                        deepstack_layers = [[] for _ in range(len(deepstack_output))]
-                    for layer_idx, layer_embeds in enumerate(deepstack_output):
-                        layer_slice = layer_embeds[start_idx:end_idx]
-                        layer_item = gather_mm_placeholders(
-                            layer_slice,
-                            is_embed=is_embed,
-                        )
-                        deepstack_layers[layer_idx].append(layer_item)
         if not mm_embeds:
-            if deepstack_layers is None:
-                return None
+            return None
         flattened_embeds = flatten_embeddings(mm_embeds)
         if flattened_embeds.shape[0] == 0:
-            if deepstack_layers is None:
-                return None
+            return None
 
         padding = jnp.zeros((target_pad_len - flattened_embeds.shape[0],
                              flattened_embeds.shape[1]),
                             dtype=flattened_embeds.dtype)
         flattened_embeds = jnp.concatenate([flattened_embeds, padding], axis=0)
 
-        deepstack_embeds = None
-        if deepstack_layers is not None:
-            deepstack_embeds = []
-            for layer_items in deepstack_layers:
-                if layer_items:
-                    layer_flat = flatten_embeddings(layer_items)
-                else:
-                    layer_flat = jnp.zeros((0, deepstack_dim),
-                                           dtype=deepstack_dtype)
-                layer_padding = jnp.zeros(
-                    (target_pad_len - layer_flat.shape[0], layer_flat.shape[1]),
-                    dtype=layer_flat.dtype)
-                deepstack_embeds.append(
-                    jnp.concatenate([layer_flat, layer_padding], axis=0))
-
-        if deepstack_embeds is not None:
-            return flattened_embeds, deepstack_embeds
         return flattened_embeds

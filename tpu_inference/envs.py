@@ -21,10 +21,17 @@ if TYPE_CHECKING:
     PHASED_PROFILING_DIR: str = ""
     PYTHON_TRACER_LEVEL: int = 1
     USE_MOE_EP_KERNEL: bool = False
+    USE_UNFUSED_MEGABLOCKS: bool = False
+    USE_DENSE_MOE: bool = False
     NUM_SLICES: int = 1
     RAY_USAGE_STATS_ENABLED: str = "0"
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: str = "shm"
     ENABLE_QUANTIZED_MATMUL_KERNEL: bool = False
+    REQUANTIZE_BLOCK_SIZE: int | None = None
+    REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
+    MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
+    MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
+    LAYOUT_Q_PROJ_AS_NDH: bool = False
 
 
 def env_with_choices(
@@ -130,6 +137,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MODEL_IMPL_TYPE":
     env_with_choices("MODEL_IMPL_TYPE", "auto",
                      ["auto", "vllm", "flax_nnx", "jetpack"]),
+    # Enable 2D tensor parallelism, shard attention heads across multiple axes
+    "USE_2D_TP":
+    env_bool("USE_2D_TP", default=False),
     # Enable new experimental model design
     "NEW_MODEL_DESIGN":
     env_bool("NEW_MODEL_DESIGN", default=False),
@@ -142,6 +152,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use custom expert-parallel kernel for MoE (Mixture of Experts)
     "USE_MOE_EP_KERNEL":
     env_bool("USE_MOE_EP_KERNEL", default=False),
+    # Enable megablocks for JAX sparse matmul for MoE (Mixture of Experts)
+    # using Unfused weights
+    "USE_UNFUSED_MEGABLOCKS":
+    env_bool("USE_UNFUSED_MEGABLOCKS", default=False),
+    # Enable the dense backend for Jax MoE (Mixture of Experts)
+    # NOTE: this is a naive implementation and should not be used in production
+    "USE_DENSE_MOE":
+    env_bool("USE_DENSE_MOE", default=False),
     # Number of TPU slices for multi-slice mesh
     "NUM_SLICES":
     lambda: int(os.getenv("NUM_SLICES") or "1"),
@@ -153,6 +171,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_with_choices("VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE", "shm", ["shm"]),
     "ENABLE_QUANTIZED_MATMUL_KERNEL":
     lambda: bool(int(os.getenv("ENABLE_QUANTIZED_MATMUL_KERNEL") or "0")),
+    # Specify block quantization size
+    "REQUANTIZE_BLOCK_SIZE":
+    lambda: int(block_size) if
+    (block_size := os.getenv("REQUANTIZE_BLOCK_SIZE")) is not None else None,
+    # Specify dtype for quantized linear weights
+    "REQUANTIZE_WEIGHT_DTYPE":
+    lambda: os.getenv("REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"),
+    # Specify dtype for quantized MoE weights
+    "MOE_REQUANTIZE_WEIGHT_DTYPE":
+    lambda: os.getenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"),
+    # Specify requantization block size for MoE weights
+    "MOE_REQUANTIZE_BLOCK_SIZE":
+    lambda: int(block_size) if (block_size := os.getenv(
+        "MOE_REQUANTIZE_BLOCK_SIZE")) is not None else None,
+    # dictates whether to layout q-proj as NDH (q-heads, model dim, head dim)
+    # or DNH (model dim, q-heads, head dim), which is the default (False)
+    "LAYOUT_Q_PROJ_AS_NDH":
+    lambda: bool(int(os.getenv("LAYOUT_Q_PROJ_AS_NDH") or "0")),
 }
 
 

@@ -22,26 +22,31 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax.sharding import Mesh
-from transformers import modeling_flax_utils
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig)
 from vllm.config import VllmConfig
 
 from tpu_inference import utils as utils
+from tpu_inference.distributed.jax_parallel_state import get_pp_group
 from tpu_inference.layers.common.attention_interface import \
     sharded_flash_attention
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+from tpu_inference.layers.jax.layers import FlaxUtils
+from tpu_inference.layers.jax.linear import JaxEinsum
+from tpu_inference.layers.jax.pp_utils import PPMissingLayer
 from tpu_inference.logger import init_logger
-from tpu_inference.models.jax.qwen2 import Qwen2ForCausalLM
+from tpu_inference.models.jax.jax_intermediate_tensor import \
+    JaxIntermediateTensors
+from tpu_inference.models.jax.qwen2 import Qwen2Model
 # from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from tpu_inference.models.jax.utils.multi_modal_utils import (
     MultiModalEmbeddings, merge_multimodal_embeddings)
-from tpu_inference.models.jax.utils.weight_utils import (get_default_maps,
-                                                         load_hf_weights)
+from tpu_inference.models.jax.utils.weight_utils import StandardWeightLoader
 
 logger = init_logger(__name__)
 
 init_fn = nnx.initializers.uniform()
+modeling_flax_utils = FlaxUtils()
 
 DEFAULT_BLOCK_K_MAJOR = 128
 
@@ -484,14 +489,14 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         head_dim = vision_config.hidden_size // vision_config.num_heads
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
 
-        self.blocks = [
+        self.blocks = nnx.List([
             Qwen2_5_VisionBlock(
                 config=hf_config,
                 dtype=dtype,
                 rngs=rngs,
                 mesh=mesh,
             ) for _ in range(vision_config.depth)
-        ]
+        ])
         self.merger = Qwen2_5_VisionPatchMerger(
             d_model=vision_config.out_hidden_size,
             context_dim=vision_config.hidden_size,
@@ -712,10 +717,7 @@ class Qwen2_5_VisionTransformer(nnx.Module):
                                           rotary_pos_emb, cu_seqlens,
                                           cu_window_seqlens)
 
-    @partial(
-        jax.jit,
-        static_argnames=("grid_thw", ),
-    )
+    @jax.jit(static_argnames=("grid_thw", ))
     def encode_jit(self, x, grid_thw):
         window_index, rotary_pos_emb, cu_seqlens, cu_window_seqlens = self.compute_aux_arrays(
             grid_thw)
@@ -749,6 +751,7 @@ class Qwen2_5_VisionTransformer(nnx.Module):
 
 
 class Qwen2_5_VLForConditionalGeneration(nnx.Module):
+    WeightLoader = StandardWeightLoader
 
     def __init__(self, vllm_config: VllmConfig, rng_key: jax.Array,
                  mesh: Mesh) -> None:
@@ -758,17 +761,38 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         self.vllm_config = vllm_config
         self.rng = nnx.Rngs(rng_key)
         self.mesh = mesh
+        self.is_first_rank = get_pp_group().is_first_rank
 
         self.config = config
         self.multimodal_config = multimodal_config
 
-        self.visual = Qwen2_5_VisionTransformer(
-            vllm_config=vllm_config,
-            rngs=self.rng,
-            mesh=mesh,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-        )
-        self.language_model = Qwen2ForCausalLM(vllm_config, rng_key, mesh)
+        self.is_last_rank = get_pp_group().is_last_rank
+
+        if self.is_first_rank:
+            self.visual = Qwen2_5_VisionTransformer(
+                vllm_config=vllm_config,
+                rngs=self.rng,
+                mesh=mesh,
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+            )
+        else:
+            self.visual = PPMissingLayer()
+
+        self.model = Qwen2Model(vllm_config, self.rng, mesh)
+        model_config = vllm_config.model_config
+        if not model_config.hf_config.tie_word_embeddings:
+            if self.is_last_rank:
+                vocab_size = model_config.get_vocab_size()
+                hidden_size = model_config.hf_config.hidden_size
+                self.lm_head = JaxEinsum(
+                    einsum_str="TD,DV->TV",
+                    kernel_shape=(hidden_size, vocab_size),
+                    dtype=model_config.dtype,
+                    rngs=self.rng,
+                    quant_config=vllm_config.quant_config,
+                )
+            else:
+                self.lm_head = PPMissingLayer()
 
     def get_mrope_input_positions(
         self,
@@ -1014,6 +1038,9 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
                                                      ...],
                          **kwargs: object) -> MultiModalEmbeddings:
 
+        if not self.is_first_rank:
+            return ()
+
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(
             image_grid_thw, **kwargs)
         if not mm_input_by_modality:
@@ -1040,7 +1067,10 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
             self, input_ids: jax.Array,
             multimodal_embeddings: Optional[jax.Array]) -> jax.Array:
 
-        inputs_embeds = self.language_model.model.embed(input_ids)
+        if not self.is_first_rank:
+            return None
+
+        inputs_embeds = self.model.embed_tokens(input_ids)
 
 
         if multimodal_embeddings is not None \
@@ -1057,55 +1087,51 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         input_ids: Optional[jax.Array],
         attention_metadata: AttentionMetadata,
         inputs_embeds: Optional[jax.Array] = None,
+        _input_positions=None,
+        _layer_name_to_kv_cache=None,
+        _lora_metadata=None,
+        intermediate_tensors: Optional[JaxIntermediateTensors] = None,
+        is_first_rank: bool = True,
+        is_last_rank: bool = True,
         *args,
-    ) -> tuple[list[jax.Array], jax.Array, List[jax.Array]]:
+    ) -> tuple[list[jax.Array], jax.Array | JaxIntermediateTensors,
+               List[jax.Array]]:
         # The logic of choosing between input_ids and inputs_embeds is
-        # handled inside self.language_model.__call__
-        kv_caches, x, [] = self.language_model(
+        # handled inside self.model.__call__
+        if not is_first_rank:
+            assert intermediate_tensors is not None
+            inputs_embeds = intermediate_tensors["hidden_states"]
+
+        kv_caches, x = self.model(
             kv_caches=kv_caches,
             input_ids=input_ids,
             attention_metadata=attention_metadata,
             inputs_embeds=inputs_embeds,
         )
+
+        if not is_last_rank:
+            x = JaxIntermediateTensors(tensors={"hidden_states": x})
+
         return kv_caches, x, []
 
     def compute_logits(self, hidden_states: jax.Array) -> jax.Array:
-        return self.language_model.compute_logits(hidden_states)
+        if hasattr(self, 'lm_head'):
+            return self.lm_head(hidden_states)
+
+        return self.model.embed_tokens.decode(hidden_states)
 
     def load_weights(self, rng_key: jax.Array) -> None:
         self.rng = nnx.Rngs(rng_key)
-        self.language_model.rng = self.rng
-
         # Key: path to a HF layer weight
         # Value: a tuple of (path to a nnx layer weight, nnx weight sharding)
 
+        self.pp_missing_layers = []
+        for path, module in nnx.iter_graph(self):
+            if isinstance(module, PPMissingLayer):
+                layer_name = ".".join([str(s) for s in path])
+                self.pp_missing_layers.append(layer_name)
+
         mappings = {
-            "model.embed_tokens": "language_model.model.embed.embedding",
-            "model.layers.*.input_layernorm":
-            "language_model.model.layers.*.input_layernorm.scale",
-            "model.layers.*.mlp.down_proj":
-            "language_model.model.layers.*.mlp.down_proj.kernel",
-            "model.layers.*.mlp.gate_proj":
-            "language_model.model.layers.*.mlp.gate_proj.kernel",
-            "model.layers.*.mlp.up_proj":
-            "language_model.model.layers.*.mlp.up_proj.kernel",
-            "model.layers.*.post_attention_layernorm":
-            "language_model.model.layers.*.post_attention_layernorm.scale",
-            "model.layers.*.self_attn.k_proj":
-            "language_model.model.layers.*.self_attn.k_proj.kernel",
-            "model.layers.*.self_attn.o_proj":
-            "language_model.model.layers.*.self_attn.o_proj.kernel",
-            "model.layers.*.self_attn.q_proj":
-            "language_model.model.layers.*.self_attn.q_proj.kernel",
-            "model.layers.*.self_attn.v_proj":
-            "language_model.model.layers.*.self_attn.v_proj.kernel",
-            "model.layers.*.self_attn.q_proj.bias":
-            "language_model.model.layers.*.self_attn.q_proj.bias",
-            "model.layers.*.self_attn.k_proj.bias":
-            "language_model.model.layers.*.self_attn.k_proj.bias",
-            "model.layers.*.self_attn.v_proj.bias":
-            "language_model.model.layers.*.self_attn.v_proj.bias",
-            "model.norm": "language_model.model.norm.scale",
             "visual.blocks.*.attn.proj.bias": "visual.blocks.*.attn.proj.bias",
             "visual.blocks.*.attn.proj": "visual.blocks.*.attn.proj.kernel",
             "visual.blocks.*.attn.qkv.bias":
@@ -1133,31 +1159,34 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
             "visual.patch_embed.proj": "visual.patch_embed.proj.kernel",
         }
 
-        # Add lm_head mapping only if it's not tied to embeddings
-        hf_config = self.vllm_config.model_config.hf_config
-        if not hf_config.tie_word_embeddings:
-            mappings.update({
-                "lm_head": "language_model.model.lm_head",
-            })
-
-        metadata_map = get_default_maps(self.vllm_config.model_config,
-                                        self.mesh, mappings)
-        load_hf_weights(vllm_config=self.vllm_config,
-                        model=self,
-                        metadata_map=metadata_map,
-                        mesh=self.mesh)
+        loader = self.WeightLoader(self.vllm_config, self.mesh)
+        keep_hf_weight_suffix_when_match = ['model']
+        if not self.vllm_config.model_config.hf_config.tie_word_embeddings:
+            keep_hf_weight_suffix_when_match.append('lm_head')
+        loader.load_weights(
+            self,
+            mappings,
+            keep_hf_weight_suffix_when_match=keep_hf_weight_suffix_when_match)
 
     def precompile_vision_encoder(
         self,
         run_compilation_fn: Callable,
     ) -> None:
+        if not self.is_first_rank:
+            return
+
         vc = self.vllm_config.model_config.hf_config.vision_config
         patch_input_dim = vc.in_channels * vc.temporal_patch_size * vc.patch_size * vc.patch_size
         if self.visual.enable_dynamic_image_sizes:
             spatial_merge_unit = vc.spatial_merge_size**2
             max_num_batched_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
             mm_kwargs = self.vllm_config.model_config.multimodal_config.mm_processor_kwargs or {}
-            limit_pixels = float(mm_kwargs.get("max_pixels", float('inf')))
+            # Use size.longest_edge if provided, otherwise default to inf
+            if "size" in mm_kwargs and "longest_edge" in mm_kwargs.get(
+                    "size", {}):
+                limit_pixels = float(mm_kwargs["size"]["longest_edge"])
+            else:
+                limit_pixels = float('inf')
 
             max_patches = int(
                 min(max_num_batched_tokens * spatial_merge_unit,

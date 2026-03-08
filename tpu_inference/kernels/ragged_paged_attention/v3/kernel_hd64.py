@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-A variant of TPU-Friendly Ragged Paged Attention kernel optimized for
+"""A variant of TPU-Friendly Ragged Paged Attention kernel optimized for
+
 head_dim = 64.
 """
 
@@ -394,7 +394,7 @@ def _ragged_paged_attention_kernel(
                 q = jnp.clip(q, min=minval, max=maxval)
             q = q.astype(kv.dtype)
 
-        s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
+        s = jnp.matmul(q, kv.T, preferred_element_type=jnp.float32)
         s *= sm_scale
         if k_scale is not None:
             s *= k_scale
@@ -437,21 +437,25 @@ def _ragged_paged_attention_kernel(
         return p, exp_m_diff
 
     def flash_attention_step2_pv(
-        q_shape_0,
         kv,  # [bkv_sz, actual_head_dim_x2]
-        p,  # from step1
-        exp_m_diff,  # from step1
+        p,  # [actual_bq_sz * num_q_heads_per_kv_head, bkv_sz] from step1
+        exp_m_diff,  # [actual_bq_sz * num_q_heads_per_kv_head] from step1
         *,
         bkv_idx,
         kv_head_idx,
     ):
-        head_acc_ref = acc_ref.at[kv_head_idx, :q_shape_0]
+        assert len(p.shape) == 2
+        assert p.shape[0] % num_q_heads_per_kv_head == 0
+        assert p.shape[1] == bkv_sz
+        assert kv.shape == (bkv_sz, actual_head_dim_x2)
+
+        head_acc_ref = acc_ref.at[kv_head_idx, :p.shape[0]]
 
         def load_with_init(ref, init_val):
             return jnp.where(bkv_idx == bkv_idx_start,
                              jnp.full_like(ref, init_val), ref[...])
 
-        pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
+        pv = jnp.matmul(p, kv, preferred_element_type=jnp.float32)
         if v_scale is not None:
             pv *= v_scale
 
@@ -486,14 +490,11 @@ def _ragged_paged_attention_kernel(
         kv_left = kv_len - kv_len_start
         kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
         kv_left_frm_new = kv_left - kv_left_frm_cache
-        bkv_p_frm_cache = jnp.minimum(cdiv(kv_left_frm_cache, page_size),
-                                      bkv_p)
-        bkv_sz_frm_new = jnp.minimum(
-            jnp.maximum(bkv_sz - kv_left_frm_cache, 0), kv_left_frm_new)
-        page_indices_offset = seq_idx * pages_per_seq + kv_p_start
 
-        # Make sure the current bkv buffer is safe to overwrite.
-        wait_update_kv_cache(bkv_sem_idx)
+        bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, bkv_sz)
+        bkv_sz_frm_new = jnp.minimum(bkv_sz - bkv_sz_frm_cache,
+                                     kv_left_frm_new)
+        page_indices_offset = seq_idx * pages_per_seq + kv_p_start
 
         debug_print(
             "[RPA debug]"
@@ -506,55 +507,49 @@ def _ragged_paged_attention_kernel(
         debug_print("[RPA debug] kv_left={}", kv_left)
         debug_print("[RPA debug] kv_left_frm_cache={}", kv_left_frm_cache)
         debug_print("[RPA debug] kv_left_frm_new={}", kv_left_frm_new)
-        debug_print("[RPA debug] bkv_p_frm_cache={}", bkv_p_frm_cache)
+        debug_print("[RPA debug] bkv_sz_frm_cache={}", bkv_sz_frm_cache)
         debug_print("[RPA debug] bkv_sz_frm_new={}", bkv_sz_frm_new)
         debug_print("[RPA debug] page_indices_offset={}", page_indices_offset)
 
         if not wait:
-            # Fetch effective kv from kv cache.
-            def loop_body(i, offset):
-                sz = jnp.minimum(page_size, kv_left_frm_cache - i * page_size)
+            # Make sure the current bkv buffer is safe to overwrite.
+            wait_update_kv_cache(bkv_sem_idx)
+
+            # Fetch effective kv from kv cache. To pipeline multiple DMA calls, we
+            # utilize static for loop instead of dynamic for loop.
+            for i in range(bkv_p):
+                # Ensure only effective kvs are copied.
+                sz = jnp.clip(kv_left_frm_cache - i * page_size, 0, page_size)
+                # If the page index is out of bound, we set page_idx to the last page.
+                # And there will be no copy since sz will be 0.
+                page_idx = jnp.minimum(page_indices_offset + i,
+                                       num_page_indices - 1)
                 _async_copy(
                     cache_hbm_ref.at[pl.ds(
-                        page_indices_ref[page_indices_offset + i] * page_size,
-                        sz)],
+                        page_indices_ref[page_idx] * page_size, sz)],
                     vmem_ref.at[pl.ds(i * page_size, sz)],
                     sem,
                     wait=False,
                 )
                 debug_print("[RPA debug] loop_body i={}, sz={}", i, sz)
-                return offset + sz
 
-            offset = lax.fori_loop(
-                0,
-                bkv_p_frm_cache,
-                loop_body,
-                0,  # offset
-                unroll=False,
-            )
-
-            size = lax.select(bkv_sz_frm_new > 0, bkv_sz_frm_new, 0)
             new_kv_len_start = q_end - kv_left_frm_new
             debug_print("[RPA debug] new_kv_len_start={}", new_kv_len_start)
-            debug_print("[RPA debug] offset_in_bkv={}", offset)
             _async_copy(
-                kv_hbm_ref.at[pl.ds(new_kv_len_start, size)],
-                vmem_ref.at[pl.ds(offset, size)],
+                kv_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
+                vmem_ref.at[pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)],
                 sem,
                 wait,
             )
-
-            return kv_len_start + offset, bkv_sz_frm_new
         else:
-            offset = jnp.minimum(kv_left_frm_cache, page_size * bkv_p)
-            dst = vmem_ref.at[pl.ds(0, offset + bkv_sz_frm_new)]
+            dst = vmem_ref.at[pl.ds(0, bkv_sz_frm_cache + bkv_sz_frm_new)]
             _async_copy(
                 src=dst,
                 dst=dst,
                 sem=sem,
                 wait=True,
             )
-            return kv_len_start + offset, bkv_sz_frm_new
+        return kv_len_start + bkv_sz_frm_cache, bkv_sz_frm_new
 
     def _update_kv_cache(seq_idx,
                          bkv_sem_idx,
@@ -861,7 +856,6 @@ def _ragged_paged_attention_kernel(
                     return
 
                 # Flash attention with cur bkv and bq
-                prev_bq_shape_0 = None
                 prev_kv_head_bkv = None
                 prev_kv_head_idx = None
                 prev_kv_head_p = None
@@ -880,7 +874,7 @@ def _ragged_paged_attention_kernel(
                         cur_kv_head_bq = load_bq(bq_sem_idx,
                                                  cur_kv_head_idx,
                                                  actual_bq_sz=actual_bq_sz)
-                        cur_kv_head__bkv = bkv_lst[i]
+                        cur_kv_head_bkv = bkv_lst[i]
                         # FlashAttention is divided into `flash_attention_step1_qk_softmax`
                         # and `flash_attention_step2_pv` to pipeline the computation.
                         # `step2_pv` for the previous KV head, which depends on the softmax
@@ -889,30 +883,27 @@ def _ragged_paged_attention_kernel(
                         cur_kv_head_p, cur_kv_head_exp_m_diff = (
                             flash_attention_step1_qk_softmax(
                                 cur_kv_head_bq,
-                                cur_kv_head__bkv,
+                                cur_kv_head_bkv,
                                 bq_idx=bq_idx,
                                 bkv_idx=bkv_idx,
                                 kv_head_idx=cur_kv_head_idx,
                             ))
-                        if prev_bq_shape_0 is not None:
+                        if prev_kv_head_p is not None:
                             flash_attention_step2_pv(
-                                prev_bq_shape_0,
                                 prev_kv_head_bkv,
                                 prev_kv_head_p,
                                 prev_kv_head_exp_m_diff,
                                 bkv_idx=bkv_idx,
                                 kv_head_idx=prev_kv_head_idx,
                             )
-                        prev_bq_shape_0 = cur_kv_head_bq.shape[0]
-                        prev_kv_head_bkv = cur_kv_head__bkv
+                        prev_kv_head_bkv = cur_kv_head_bkv
                         prev_kv_head_p = cur_kv_head_p
                         prev_kv_head_exp_m_diff = cur_kv_head_exp_m_diff
                         prev_kv_head_idx = cur_kv_head_idx
 
                 # Execute pv of last attention head.
-                assert prev_bq_shape_0 is not None
+                assert prev_kv_head_p is not None
                 flash_attention_step2_pv(
-                    prev_bq_shape_0,
                     prev_kv_head_bkv,
                     prev_kv_head_p,
                     prev_kv_head_exp_m_diff,
@@ -1324,12 +1315,14 @@ def static_validate_inputs(
     del debug_mode
 
 
-def get_kernel_scope_name(bq_size, bkv_p, page_size):
-    return f"RPA-HD_64-bq_{bq_size}-bkvp_{bkv_p}-p_{page_size}-"
+def get_kernel_scope_name(bq_size, bkv_p, page_size, sliding_window):
+    name = f"RPA-HD_64-bq_{bq_size}-bkvp_{bkv_p}-p_{page_size}"
+    if sliding_window is not None:
+        name += f"-sw_{sliding_window}"
+    return name
 
 
-@functools.partial(
-    jax.jit,
+@jax.jit(
     static_argnames=(
         "sm_scale",
         "sliding_window",
@@ -1537,7 +1530,7 @@ def ragged_paged_attention_hd64(
         jnp.full((6, ), -1, jnp.int32),
     )
 
-    scope_name = get_kernel_scope_name(bq_sz, bkv_p, page_size)
+    scope_name = get_kernel_scope_name(bq_sz, bkv_p, page_size, sliding_window)
     kernel = pl.pallas_call(
         functools.partial(
             _ragged_paged_attention_kernel,
@@ -1565,6 +1558,10 @@ def ragged_paged_attention_hd64(
             # one, we need some extra work to support Megacore mode.
             dimension_semantics=("arbitrary", ),
             vmem_limit_bytes=vmem_limit_bytes,
+            # Paged attention invokes multiple small DMAs for each pages instead
+            # of a single large DMA. Therefore, the overhead of bounds checking
+            # becomes too significant so we disable it.
+            disable_bounds_checks=True,
         ),
         out_shape=[
             jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),

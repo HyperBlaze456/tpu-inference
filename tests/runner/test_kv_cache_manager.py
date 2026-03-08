@@ -19,11 +19,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from vllm.attention.backends.abstract import AttentionType
-from vllm.attention.layer import Attention
 from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
                          SchedulerConfig, VllmConfig)
+from vllm.model_executor.layers.attention import Attention
 from vllm.sampling_params import SamplingType
+from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheGroupSpec, KVCacheTensor,
                                         MLAAttentionSpec, SlidingWindowSpec)
@@ -31,6 +31,7 @@ from vllm.v1.request import Request
 
 from tpu_inference import utils as common_utils
 from tpu_inference.runner.input_batch import CachedRequestState
+from tpu_inference.runner.kv_cache import get_attention_page_size_bytes
 from tpu_inference.runner.tpu_runner import TPUModelRunner
 
 
@@ -58,11 +59,7 @@ class TestKVCacheManager:
              patch('jax.random.key', return_value=self.mock_rng_key), \
              patch('tpu_inference.runner.tpu_runner.get_model', return_value=MagicMock()):
 
-            model_config = ModelConfig(tokenizer_mode="auto",
-                                       trust_remote_code=False,
-                                       seed=0,
-                                       dtype='bfloat16',
-                                       use_mla=use_mla)
+            model_config = ModelConfig()
             cache_config = CacheConfig(
                 block_size=16,
                 gpu_memory_utilization=0.9,
@@ -75,7 +72,6 @@ class TestKVCacheManager:
             parallel_config = ParallelConfig(
                 pipeline_parallel_size=1,
                 tensor_parallel_size=1,
-                worker_use_ray=False,
             )
             vllm_config = VllmConfig(
                 model_config=model_config,
@@ -269,19 +265,28 @@ class TestKVCacheManager:
 
         kv_cache_spec = self.runner.get_kv_cache_spec()
 
+        block_size = self.runner.vllm_config.cache_config.block_size
+        num_kv_heads = common_utils.get_padded_num_heads(
+            num_kv_heads, self.runner.mesh.shape["model"])
+        head_size = common_utils.get_padded_head_dim(head_size)
+
         expected_full_attn_spec = FullAttentionSpec(
-            block_size=self.runner.vllm_config.cache_config.block_size,
-            num_kv_heads=common_utils.get_padded_num_heads(
-                num_kv_heads, self.runner.mesh.shape["model"]),
-            head_size=common_utils.get_padded_head_dim(head_size),
-            dtype=torch.bfloat16)
-        expected_sliding_window_spec = SlidingWindowSpec(
-            block_size=self.runner.vllm_config.cache_config.block_size,
-            num_kv_heads=common_utils.get_padded_num_heads(
-                num_kv_heads, self.runner.mesh.shape["model"]),
-            head_size=common_utils.get_padded_head_dim(head_size),
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
             dtype=torch.bfloat16,
-            sliding_window=sliding_window)
+            page_size_padded=get_attention_page_size_bytes(
+                self.runner.mesh, block_size, num_kv_heads, head_size,
+                self.runner.kv_cache_dtype, False))
+        expected_sliding_window_spec = SlidingWindowSpec(
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            dtype=torch.bfloat16,
+            sliding_window=sliding_window,
+            page_size_padded=get_attention_page_size_bytes(
+                self.runner.mesh, block_size, num_kv_heads, head_size,
+                self.runner.kv_cache_dtype, False))
         assert len(kv_cache_spec) == 20
         for i in range(10):
             assert kv_cache_spec[f'layer.{i}'] == expected_full_attn_spec
@@ -342,12 +347,18 @@ class TestKVCacheManager:
         kv_cache_spec = self.runner.get_kv_cache_spec()
 
         assert len(kv_cache_spec) == num_layers
+        block_size = self.runner.vllm_config.cache_config.block_size
+        num_kv_heads = common_utils.get_padded_num_heads(
+            num_kv_heads, self.runner.mesh.shape["model"])
+        head_size = common_utils.get_padded_head_dim(head_size)
         expected_full_attn_spec = FullAttentionSpec(
-            block_size=self.runner.vllm_config.cache_config.block_size,
-            num_kv_heads=common_utils.get_padded_num_heads(
-                num_kv_heads, self.runner.mesh.shape["model"]),
-            head_size=common_utils.get_padded_head_dim(head_size),
-            dtype=torch.bfloat16)
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            dtype=torch.bfloat16,
+            page_size_padded=get_attention_page_size_bytes(
+                self.runner.mesh, block_size, num_kv_heads, head_size,
+                self.runner.kv_cache_dtype, False))
         for i in range(num_layers):
             assert kv_cache_spec[f'layer.{i}'] == expected_full_attn_spec
         assert len(self.runner.kv_cache_manager.shared_kv_cache_layers) == 0
@@ -496,3 +507,103 @@ class TestKVCacheManager:
             spec = kv_cache_spec[f"layer.{i}"]
             assert isinstance(spec, MLAAttentionSpec)
             assert spec.num_kv_heads == 1
+
+    def test_delete_kv_cache(self):
+        """Test that delete_kv_cache deletes JAX arrays and clears state."""
+        # First, initialize KV cache using the same setup as
+        # test_initialize_kv_cache.
+        block_size = self.runner.vllm_config.cache_config.block_size
+        num_kv_heads = 8
+        head_size = 128
+        num_blocks = 100
+        full_attn_spec = FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            dtype=torch.bfloat16,
+        )
+        kv_cache_groups = [
+            KVCacheGroupSpec(layer_names=[f'layer.{i}' for i in range(10)],
+                             kv_cache_spec=full_attn_spec),
+        ]
+        page_size_bytes = full_attn_spec.page_size_bytes
+        kv_cache_tensors = [
+            KVCacheTensor(
+                size=num_blocks * page_size_bytes,
+                shared_by=[f'layer.{i}'],
+            ) for i in range(10)
+        ]
+        kv_cache_config = KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=kv_cache_tensors,
+            kv_cache_groups=kv_cache_groups,
+        )
+
+        self.runner.initialize_kv_cache(kv_cache_config)
+        assert len(self.runner.kv_caches) == 10
+        assert len(self.runner.layer_name_to_kvcache_index) == 10
+
+        # Now reset.
+        self.runner.delete_kv_cache()
+
+        assert len(self.runner.kv_caches) == 0
+        assert len(self.runner.layer_name_to_kvcache_index) == 0
+
+    def test_reinitialize_kv_cache(self):
+        """Test that reinitialize_kv_cache reallocates fresh KV cache."""
+        block_size = self.runner.vllm_config.cache_config.block_size
+        num_kv_heads = 8
+        head_size = 128
+        num_blocks = 100
+        kv_packing = 2  # bf16
+        full_attn_spec = FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            dtype=torch.bfloat16,
+        )
+        kv_cache_groups = [
+            KVCacheGroupSpec(layer_names=[f'layer.{i}' for i in range(10)],
+                             kv_cache_spec=full_attn_spec),
+        ]
+        page_size_bytes = full_attn_spec.page_size_bytes
+        kv_cache_tensors = [
+            KVCacheTensor(
+                size=num_blocks * page_size_bytes,
+                shared_by=[f'layer.{i}'],
+            ) for i in range(10)
+        ]
+        kv_cache_config = KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=kv_cache_tensors,
+            kv_cache_groups=kv_cache_groups,
+        )
+
+        self.runner.initialize_kv_cache(kv_cache_config)
+        assert len(self.runner.kv_caches) == 10
+
+        # Reset and then reinitialize.
+        self.runner.delete_kv_cache()
+        assert len(self.runner.kv_caches) == 0
+
+        self.runner.reinitialize_kv_cache()
+        assert len(self.runner.kv_caches) == 10
+        for i in range(10):
+            assert self.runner.kv_caches[i].shape == (num_blocks, block_size,
+                                                      num_kv_heads * 2 //
+                                                      kv_packing, kv_packing,
+                                                      head_size)
+            assert self.runner.layer_name_to_kvcache_index[f'layer.{i}'] == i
+
+    def test_reinitialize_kv_cache_without_init_raises(self):
+        """Test that reinitialize raises if initialize was never called."""
+        # kv_cache_config is not set on a fresh runner.
+        with pytest.raises(RuntimeError, match="Cannot reinitialize KV cache"):
+            self.runner.reinitialize_kv_cache()
+
+    def test_delete_kv_cache_no_op_when_empty(self):
+        """Test that delete_kv_cache is safe to call when no KV cache exists."""
+        assert len(self.runner.kv_caches) == 0
+        # Should not raise.
+        self.runner.delete_kv_cache()
+        assert len(self.runner.kv_caches) == 0

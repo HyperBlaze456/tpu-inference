@@ -47,28 +47,28 @@ def gen_moe_inputs(
     key = jax.random.key(seed)
     k0, k1, k2, k3, k4, k5, k6 = jax.random.split(key, 7)
 
-    a = jax.random.normal(k0, (num_tokens, hidden_size),
-                          dtype=jnp.float32).astype(dtype) / 10
+    a = (jax.random.normal(k0, (num_tokens, hidden_size),
+                           dtype=jnp.bfloat16).astype(dtype) / 10)
 
     w1 = (jax.random.normal(
         k1,
         (num_experts, 2, hidden_size, intermediate_size),
-        dtype=jnp.float32,
+        dtype=jnp.bfloat16,
     ) / 10).astype(dtype)
     w2 = (jax.random.normal(k2, (num_experts, intermediate_size, hidden_size),
-                            dtype=jnp.float32) / 10).astype(dtype)
+                            dtype=jnp.bfloat16) / 10).astype(dtype)
 
     if has_bias:
-        b1 = (jax.random.normal(k3, (num_experts, 2, intermediate_size),
-                                dtype=jnp.float32) / 10).astype(dtype)
-        b2 = (jax.random.normal(k4, (num_experts, hidden_size),
-                                dtype=jnp.float32) / 10).astype(dtype)
+        b1 = (jax.random.normal(k3, (num_experts, 2, 1, intermediate_size),
+                                dtype=jnp.bfloat16) / 10).astype(dtype)
+        b2 = (jax.random.normal(k4, (num_experts, 1, hidden_size),
+                                dtype=jnp.bfloat16) / 10).astype(dtype)
     else:
         b1 = b2 = None
 
     gating_output = (
-        jax.random.normal(k5, (num_tokens, num_experts), dtype=jnp.float32) +
-        jnp.arange(num_tokens * num_experts, dtype=jnp.float32).reshape(
+        jax.random.normal(k5, (num_tokens, num_experts), dtype=jnp.bfloat16) +
+        jnp.arange(num_tokens * num_experts, dtype=jnp.bfloat16).reshape(
             num_tokens, num_experts) / 100)
 
     # To generate unique top-k!
@@ -78,7 +78,7 @@ def gen_moe_inputs(
                                        dtype=jnp.int32)
 
     one_hot = (jnp.sum(
-        jax.nn.one_hot(top_k_indices, num_experts, dtype=jnp.float32),
+        jax.nn.one_hot(top_k_indices, num_experts, dtype=jnp.bfloat16),
         axis=1,
     ) * 30)
 
@@ -103,8 +103,9 @@ def sub_channel_quantize(x, quant_dtype, wsz=256):
         scale = (abs_max / dtype_max).astype(jnp.float32)
         w = (y / scale).astype(quant_dtype)
         w_lst.append(w)
+        scale = jnp.expand_dims(scale, axis=-2)
         scale_lst.append(scale)
-    return jnp.concat(w_lst, axis=-2), jnp.concat(scale_lst, axis=-2)
+    return jnp.concat(w_lst, axis=-2), jnp.concat(scale_lst, axis=-3)
 
 
 @jtu.with_config(jax_numpy_dtype_promotion="standard")
@@ -112,6 +113,8 @@ class MoEKernelTest(jtu.JaxTestCase):
 
     def setUp(self):
         super().setUp()
+        if not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("Expect TPUv7+")
         self.mesh_devices = sorted(
             jax.devices(),
             key=lambda x: (
@@ -141,8 +144,10 @@ class MoEKernelTest(jtu.JaxTestCase):
         bd1c,
         bd2c,
         act_fn="silu",
+        scoring_fn="softmax",
         w_dtype=None,
-        subc_quant_wsz=None,
+        subc_quant_w1_sz=None,
+        subc_quant_w2_sz=None,
         has_bias=False,
         atol=2e-1,
         rtol=2e-1,
@@ -160,10 +165,12 @@ class MoEKernelTest(jtu.JaxTestCase):
         w1_scale = None
         w2_scale = None
         if w_dtype is not None:
-            if subc_quant_wsz is None:
-                subc_quant_wsz = 256
-            w1, w1_scale = sub_channel_quantize(w1, w_dtype, subc_quant_wsz)
-            w2, w2_scale = sub_channel_quantize(w2, w_dtype, subc_quant_wsz)
+            if subc_quant_w1_sz is None:
+                subc_quant_w1_sz = 256
+            if subc_quant_w2_sz is None:
+                subc_quant_w2_sz = 256
+            w1, w1_scale = sub_channel_quantize(w1, w_dtype, subc_quant_w1_sz)
+            w2, w2_scale = sub_channel_quantize(w2, w_dtype, subc_quant_w2_sz)
 
         actual = fused_ep_moe(
             mesh=self.mesh,
@@ -174,7 +181,9 @@ class MoEKernelTest(jtu.JaxTestCase):
             top_k=top_k,
             renormalize_topk_logits=renormalize_topk_logits,
             act_fn=act_fn,
-            subc_quant_wsz=subc_quant_wsz,
+            scoring_fn=scoring_fn,
+            subc_quant_w1_sz=subc_quant_w1_sz,
+            subc_quant_w2_sz=subc_quant_w2_sz,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             b1=b1,
@@ -197,8 +206,10 @@ class MoEKernelTest(jtu.JaxTestCase):
             b1=b1,
             b2=b2,
             renormalize_topk_logits=renormalize_topk_logits,
-            activation=act_fn,
-            subc_quant_wsz=subc_quant_wsz,
+            act_fn=act_fn,
+            scoring_fn=scoring_fn,
+            subc_quant_w1_sz=subc_quant_w1_sz,
+            subc_quant_w2_sz=subc_quant_w2_sz,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
         )
@@ -257,6 +268,36 @@ class MoEKernelTest(jtu.JaxTestCase):
             bfc=256,
             bd1c=256,
             bd2c=256,
+        )
+
+    @parameterized.product(scoring_fn=["softmax", "sigmoid"])
+    def test_scoring_fn(self, scoring_fn):
+        dtype = jnp.bfloat16
+        top_k = 8
+        num_experts = 128
+        hidden_size = 1024
+        intermediate_size = 1024
+        num_tokens = 8 * 32
+        self._test_moe(
+            dtype=dtype,
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_tokens=num_tokens,
+            seed=1234,
+            renormalize_topk_logits=True,
+            scoring_fn=scoring_fn,
+            bt=32,
+            bf=512,
+            bd1=512,
+            bd2=512,
+            btc=32,
+            bfc=256,
+            bd1c=256,
+            bd2c=256,
+            atol=
+            4e-1,  # loosen tolerance as jax.lax.top_k and get_top_k aren't identical on ties (related: https://github.com/jax-ml/jax/issues/34620)
         )
 
     def test_benchmark_qwen_235(self):
@@ -345,13 +386,44 @@ class MoEKernelTest(jtu.JaxTestCase):
             seed=1234,
             renormalize_topk_logits=False,
             w_dtype=w_dtype,
-            subc_quant_wsz=256,
+            subc_quant_w1_sz=256,
+            subc_quant_w2_sz=256,
             bt=32,
             bf=1024,
             bd1=1024,
             bd2=1024,
             btc=32,
             bfc=256,
+            bd1c=256,
+            bd2c=256,
+        )
+
+    @parameterized.product(w_dtype=[jnp.int8, jnp.float8_e5m2], )
+    def test_per_channel_quantization(self, w_dtype):
+        dtype = jnp.bfloat16
+        top_k = 8
+        num_experts = 128
+        hidden_size = 512
+        intermediate_size = 1024
+        num_tokens = 8 * 32
+        self._test_moe(
+            dtype=dtype,
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_tokens=num_tokens,
+            seed=1234,
+            renormalize_topk_logits=False,
+            w_dtype=w_dtype,
+            subc_quant_w1_sz=hidden_size,
+            subc_quant_w2_sz=intermediate_size,
+            bt=32,
+            bf=1024,
+            bd1=hidden_size,
+            bd2=hidden_size,
+            btc=32,
+            bfc=512,
             bd1c=256,
             bd2c=256,
         )

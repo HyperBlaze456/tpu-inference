@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
 from typing import TYPE_CHECKING, List
 
 import jax
@@ -21,20 +20,23 @@ import numpy as np
 import vllm.envs as envs
 from jax.sharding import NamedSharding, PartitionSpec
 from torchax.ops.mappings import t2j_dtype
-from vllm.attention.backends.abstract import AttentionType
-from vllm.attention.layer import Attention
 from vllm.config import get_layers_from_vllm_config
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.mla import MLAAttention
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec, MLAAttentionSpec,
                                         SlidingWindowSpec)
 
 from tpu_inference import utils
 from tpu_inference import utils as common_utils
+from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.logger import init_logger
 from tpu_inference.runner import utils as runner_utils
 from tpu_inference.runner.input_batch import CachedRequestState, InputBatch
-from tpu_inference.runner.kv_cache import create_kv_caches
+from tpu_inference.runner.kv_cache import (create_kv_caches,
+                                           get_attention_page_size_bytes)
 
 if TYPE_CHECKING:
     from vllm.v1.request import Request
@@ -55,11 +57,49 @@ class KVCacheManager:
         self.shared_kv_cache_layers: dict[str, str] = {}
         self.use_mla = self.runner.model_config.use_mla
 
+    def _create_attention_spec(
+            self,
+            block_size: int,
+            num_kv_heads: int,
+            head_size: int,
+            sliding_window: bool | None = None) -> KVCacheSpec:
+        if self.use_mla:
+            page_size_bytes = get_attention_page_size_bytes(
+                self.runner.mesh, block_size, num_kv_heads, head_size,
+                self.runner.kv_cache_dtype, True)
+            return MLAAttentionSpec(block_size=block_size,
+                                    num_kv_heads=1,
+                                    head_size=head_size,
+                                    dtype=self.runner.kv_cache_dtype,
+                                    cache_dtype_str=self.runner.vllm_config.
+                                    cache_config.cache_dtype,
+                                    page_size_padded=int(page_size_bytes))
+        else:
+            page_size_bytes = get_attention_page_size_bytes(
+                self.runner.mesh, block_size, num_kv_heads, head_size,
+                self.runner.kv_cache_dtype, False)
+            if sliding_window is not None:
+                return SlidingWindowSpec(block_size=block_size,
+                                         num_kv_heads=num_kv_heads,
+                                         head_size=head_size,
+                                         dtype=self.runner.kv_cache_dtype,
+                                         sliding_window=sliding_window,
+                                         page_size_padded=int(page_size_bytes))
+            else:
+                return FullAttentionSpec(block_size=block_size,
+                                         num_kv_heads=num_kv_heads,
+                                         head_size=head_size,
+                                         dtype=self.runner.kv_cache_dtype,
+                                         page_size_padded=int(page_size_bytes))
+
     def get_kv_cache_spec(self):
         # TODO(xiang): this hack tricks engine core to init successfully
         block_size = self.runner.cache_config.block_size
         kv_cache_spec: dict[str, KVCacheSpec] = {}
 
+        tp_axis_name = ShardingAxisName.ATTN_HEAD
+        model_cnt = common_utils.get_mesh_shape_product(
+            self.runner.mesh, tp_axis_name)
         # If use pure jax (MODEL_IMPL_TYPE=flax_nnx), we don't register
         # attention into compilation config.
         # Use FullAttentionSpec for each layer
@@ -78,55 +118,74 @@ class KVCacheManager:
         if len(self.runner.vllm_config.compilation_config.
                static_forward_context) == 0:
             parallel_config = self.runner.parallel_config
-            # Pad num_kv_heads to multiple of TP size.
-            num_kv_heads = common_utils.get_padded_num_heads(
-                model_config.get_total_num_kv_heads(),
-                self.runner.mesh.shape["model"])
-            head_size = common_utils.get_padded_head_dim(
-                model_config.get_head_size())
+            text_config = getattr(model_config, "hf_text_config",
+                                  getattr(model_config, "hf_config", None))
+            base_num_kv_heads = model_config.get_total_num_kv_heads()
+            base_head_size = model_config.get_head_size()
+
             for i in range(model_config.get_num_layers(parallel_config)):
                 if self.use_mla:
-                    kv_cache_spec[f"layer.{i}"] = MLAAttentionSpec(
-                        block_size=block_size,
-                        num_kv_heads=1,
-                        head_size=mla_head_size,
-                        dtype=self.runner.kv_cache_dtype,
-                        cache_dtype_str=self.runner.vllm_config.cache_config.
-                        cache_dtype)
+                    kv_cache_spec[f"layer.{i}"] = self._create_attention_spec(
+                        block_size, 1, mla_head_size)
                 else:
-                    kv_cache_spec[f"layer.{i}"] = FullAttentionSpec(
-                        block_size=block_size,
-                        num_kv_heads=num_kv_heads,
-                        head_size=head_size,
-                        dtype=self.runner.kv_cache_dtype)
+                    # TODO(kwang3939): unify the hybrid kv cache of jax path and tochax path.
+                    layer_type = "full_attention"
+                    if hasattr(text_config, "layer_types") and i < len(
+                            text_config.layer_types):
+                        layer_type = text_config.layer_types[i]
+
+                    is_sliding = layer_type == "sliding_attention"
+                    if not is_sliding:
+                        num_kv_heads = getattr(text_config,
+                                               "num_global_key_value_heads",
+                                               base_num_kv_heads)
+                        head_size = getattr(text_config, "global_head_dim",
+                                            base_head_size)
+                    else:
+                        num_kv_heads = base_num_kv_heads
+                        head_size = base_head_size
+                    # Pad num_kv_heads to multiple of TP size.
+                    num_kv_heads = common_utils.get_padded_num_heads(
+                        num_kv_heads, model_cnt)
+                    head_size = common_utils.get_padded_head_dim(head_size)
+                    # TODO(kwang3939): Re-enable sliding_window once mixed dims with sliding_window is supported.
+                    sliding_window = None
+                    kv_cache_spec[f"layer.{i}"] = self._create_attention_spec(
+                        block_size,
+                        num_kv_heads,
+                        head_size,
+                        sliding_window=sliding_window)
+
             if self.runner.speculative_config and self.runner.speculative_config.method == "eagle3":
                 draft_model_config = self.runner.speculative_config.draft_model_config
                 hf_config = draft_model_config.hf_config
                 num_kv_heads = common_utils.get_padded_num_heads(
-                    hf_config.num_key_value_heads,
-                    self.runner.mesh.shape["model"])
+                    hf_config.num_key_value_heads, model_cnt)
                 head_size = common_utils.get_padded_head_dim(
                     hf_config.hidden_size // hf_config.num_attention_heads)
                 # Eagle3 has only 1 layer
                 for i in range(1):
                     if self.use_mla:
-                        kv_cache_spec[f"draft_layer.{i}"] = MLAAttentionSpec(
-                            block_size=block_size,
-                            num_kv_heads=1,
-                            head_size=mla_head_size,
-                            dtype=self.runner.kv_cache_dtype,
-                            cache_dtype_str=self.runner.vllm_config.
-                            cache_config.cache_dtype)
+                        kv_cache_spec[
+                            f"draft_layer.{i}"] = self._create_attention_spec(
+                                block_size, 1, mla_head_size)
                     else:
-                        kv_cache_spec[f"draft_layer.{i}"] = FullAttentionSpec(
-                            block_size=block_size,
-                            num_kv_heads=num_kv_heads,
-                            head_size=head_size,
-                            dtype=self.runner.kv_cache_dtype)
+                        kv_cache_spec[
+                            f"draft_layer.{i}"] = self._create_attention_spec(
+                                block_size, num_kv_heads, head_size)
         else:
             # Else propagate attention modules from compilation config.
-            layers = get_layers_from_vllm_config(self.runner.vllm_config,
-                                                 Attention)
+            layers = {}
+            attention_types = [Attention, MLAAttention]
+
+            for attn_cls in attention_types:
+                # Get the layers for the current class
+                new_layers = get_layers_from_vllm_config(
+                    self.runner.vllm_config, attn_cls)
+
+                # Add them to the main dictionary (equivalent to your | operator)
+                layers.update(new_layers)
+
             logger.warning(f"Compilation num_layers = {len(layers.items())}")
             for layer_name, attn_module in layers.items():
                 if (kv_tgt_layer :=
@@ -141,33 +200,27 @@ class KVCacheManager:
                     self.shared_kv_cache_layers[layer_name] = kv_tgt_layer
                     continue
                 if attn_module.attn_type == AttentionType.DECODER:
+                    num_kv_heads = common_utils.get_padded_num_heads(
+                        attn_module.num_kv_heads,
+                        self.runner.mesh.shape["model"])
+                    head_size = common_utils.get_padded_head_dim(
+                        attn_module.head_size)
+
                     if attn_module.sliding_window is not None:
-                        kv_cache_spec[layer_name] = SlidingWindowSpec(
-                            block_size=block_size,
-                            num_kv_heads=common_utils.get_padded_num_heads(
-                                attn_module.num_kv_heads,
-                                self.runner.mesh.shape["model"]),
-                            head_size=common_utils.get_padded_head_dim(
-                                attn_module.head_size),
-                            dtype=self.runner.kv_cache_dtype,
-                            sliding_window=attn_module.sliding_window)
+                        kv_cache_spec[
+                            layer_name] = self._create_attention_spec(
+                                block_size,
+                                num_kv_heads,
+                                head_size,
+                                sliding_window=attn_module.sliding_window)
                     elif self.use_mla:
-                        kv_cache_spec[layer_name] = MLAAttentionSpec(
-                            block_size=block_size,
-                            num_kv_heads=1,
-                            head_size=mla_head_size,
-                            dtype=self.runner.kv_cache_dtype,
-                            cache_dtype_str=self.runner.vllm_config.
-                            cache_config.cache_dtype)
+                        kv_cache_spec[
+                            layer_name] = self._create_attention_spec(
+                                block_size, 1, mla_head_size)
                     else:
-                        kv_cache_spec[layer_name] = FullAttentionSpec(
-                            block_size=block_size,
-                            num_kv_heads=common_utils.get_padded_num_heads(
-                                attn_module.num_kv_heads,
-                                self.runner.mesh.shape["model"]),
-                            head_size=common_utils.get_padded_head_dim(
-                                attn_module.head_size),
-                            dtype=self.runner.kv_cache_dtype)
+                        kv_cache_spec[
+                            layer_name] = self._create_attention_spec(
+                                block_size, num_kv_heads, head_size)
                 elif attn_module.attn_type in (AttentionType.ENCODER,
                                                AttentionType.ENCODER_ONLY):
                     # encoder-only attention does not need KV cache.
@@ -177,6 +230,7 @@ class KVCacheManager:
                 else:
                     raise ValueError(
                         f"Unknown attention type: {attn_module.attn_type}")
+
         return kv_cache_spec
 
     def maybe_reinitialize_input_batch(self,
@@ -186,7 +240,7 @@ class KVCacheManager:
             for kv_cache_group in kv_cache_config.kv_cache_groups
         ]
         if block_sizes != [self.runner.cache_config.block_size]:
-            assert self.runner.cache_config.cpu_offload_gb == 0, (
+            assert self.runner.vllm_config.offload_config.uva.cpu_offload_gb == 0, (
                 "Cannot re-initialize the input batch when CPU weight "
                 "offloading is enabled. See https://github.com/vllm-project/vllm/pull/18298 "  # noqa: E501
                 "for more details.")
@@ -209,12 +263,28 @@ class KVCacheManager:
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         self.maybe_reinitialize_input_batch(kv_cache_config)
 
-        # uniform page size.
-        representative_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
-        page_size_bytes = representative_spec.page_size_bytes
+        # There will be no KV cache for pooling models.
+        if not kv_cache_config.kv_cache_groups:
+            return
+
+        layer_name_to_spec = {}
+        for group in kv_cache_config.kv_cache_groups:
+            group_spec = group.kv_cache_spec
+            if hasattr(group_spec, 'kv_cache_specs'):
+                for layer_name in group.layer_names:
+                    layer_name_to_spec[layer_name] = group_spec.kv_cache_specs[
+                        layer_name]
+            else:
+                for layer_name in group.layer_names:
+                    layer_name_to_spec[layer_name] = group.kv_cache_spec
+
         kv_caches = self.runner.kv_caches
         num_blocks_list = []
         for i, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
+            layer_name = kv_cache_tensor.shared_by[0]
+            layer_spec = layer_name_to_spec[layer_name]
+
+            page_size_bytes = layer_spec.page_size_bytes
             assert kv_cache_tensor.size % page_size_bytes == 0
             num_blocks = kv_cache_tensor.size // page_size_bytes
             dp_size = self.runner.vllm_config.sharding_config.total_dp_size
@@ -225,15 +295,15 @@ class KVCacheManager:
                 head_size = self.runner.model_config.hf_config.kv_lora_rank + \
                     self.runner.model_config.hf_config.qk_rope_head_dim
             else:
-                head_size = representative_spec.head_size
+                head_size = layer_spec.head_size
             kv_cache = create_kv_caches(
                 num_blocks=num_blocks,
-                block_size=representative_spec.block_size,
-                num_kv_heads=representative_spec.num_kv_heads,
+                block_size=layer_spec.block_size,
+                num_kv_heads=layer_spec.num_kv_heads,
                 head_size=head_size,
                 mesh=self.runner.mesh,
                 layer_names=[f'kv_cache_tensor.{i}'],
-                cache_dtype=t2j_dtype(representative_spec.dtype),
+                cache_dtype=t2j_dtype(layer_spec.dtype),
                 use_mla=self.use_mla,
             )[0]
             kv_caches.append(kv_cache)
@@ -257,8 +327,69 @@ class KVCacheManager:
             f"dtype={kv_caches[0].dtype} | "
             f"hbm={utils.hbm_usage_gb(self.runner.mesh.devices.flatten())}Gb")
 
+    def delete_kv_cache(self) -> None:
+        """Delete KV cache JAX arrays to free HBM.
+        This explicitly deletes all KV cache JAX arrays, clearing the HBM
+        they occupy.
+
+        1. Avoid serving stale KV cache values from a previous model version
+           (since prefix cache keys remain constant but values become invalid
+           after weight updates).
+        2. Free HBM to reduce memory fragmentation during the HBM-heavy
+           resharding operation, allowing higher --gpu-memory-utilization
+           settings.
+        After calling this method, ``reinitialize_kv_cache`` must be called
+        to reallocate the KV cache before the next inference step.
+        """
+        kv_caches = self.runner.kv_caches
+        if not kv_caches:
+            logger.info("delete_kv_cache: No KV cache to delete.")
+            return
+
+        num_layers = len(kv_caches)
+        logger.info(
+            f"Deleting kv-cache | "
+            f"num_layers={num_layers} | "
+            f"hbm_before="
+            f"{utils.hbm_usage_gb(self.runner.mesh.devices.flatten())}Gb")
+
+        # Explicitly delete each JAX array to release HBM.
+        for kv_cache in kv_caches:
+            kv_cache.delete()
+        self.runner.kv_caches.clear()
+        self.runner.layer_name_to_kvcache_index.clear()
+
+        logger.info(
+            f"KV cache delete complete | "
+            f"hbm_after="
+            f"{utils.hbm_usage_gb(self.runner.mesh.devices.flatten())}Gb")
+
+    def reinitialize_kv_cache(self) -> None:
+        """Reinitialize KV cache from the stored configuration.
+        This reallocates fresh (empty) KV cache arrays using the
+        ``KVCacheConfig`` that was saved during the initial
+        ``initialize_kv_cache`` call.  It is intended to be called after
+        ``delete_kv_cache`` (and typically after a weight-sync / resharding
+        step) so that inference can resume with a clean cache.
+        Raises:
+            RuntimeError: If ``initialize_kv_cache`` was never called (i.e.
+                there is no stored ``kv_cache_config``).
+        """
+        kv_cache_config = getattr(self.runner, 'kv_cache_config', None)
+        if kv_cache_config is None:
+            raise RuntimeError(
+                "Cannot reinitialize KV cache: no kv_cache_config found. "
+                "initialize_kv_cache must be called first.")
+
+        logger.info(
+            f"Reinitializing kv-cache | "
+            f"hbm_before="
+            f"{utils.hbm_usage_gb(self.runner.mesh.devices.flatten())}Gb")
+
+        self.initialize_kv_cache(kv_cache_config)
+
     @staticmethod
-    @functools.partial(jax.jit)
+    @jax.jit
     def _jitted_gather_kv_cache(kv_caches: List[jax.Array],
                                 block_ids: jax.Array) -> List[jax.Array]:
         """
@@ -273,10 +404,7 @@ class KVCacheManager:
         return jax.tree.map(gather_and_reshape, kv_caches)
 
     @staticmethod
-    @functools.partial(
-        jax.jit,
-        static_argnames=("len_block"),
-    )
+    @jax.jit(static_argnames=("len_block"))
     def _jitted_gather_continuous_kv_cache(kv_caches: List[jax.Array],
                                            start_block,
                                            len_block) -> List[jax.Array]:
@@ -296,8 +424,7 @@ class KVCacheManager:
         return jax.tree.map(gather_and_reshape, kv_caches)
 
     @staticmethod
-    @functools.partial(
-        jax.jit,
+    @jax.jit(
         static_argnames=("block_size"),
         donate_argnames=(
             "kv_caches",
@@ -325,8 +452,7 @@ class KVCacheManager:
         return jax.tree.map(_update_layer, kv_caches, kv_cache_slices)
 
     @staticmethod
-    @functools.partial(
-        jax.jit,
+    @jax.jit(
         static_argnames=("block_size"),
         donate_argnames=(
             "kv_caches",
@@ -404,8 +530,8 @@ class KVCacheManager:
         logger.debug(
             f"Transferring kv cache shape {len(kv_cache_slices)} * {kv_cache_slices[0].shape} sharding {kv_cache_slices[0].sharding} size {kv_cache_slices[0].nbytes * len(kv_cache_slices)/1024/1024} Mbytes"
         )
-        sharding = NamedSharding(self.runner.mesh,
-                                 PartitionSpec(None, "model"))
+        sharding = NamedSharding(
+            self.runner.mesh, PartitionSpec(None, ShardingAxisName.ATTN_HEAD))
         if envs.VLLM_TPU_USING_PATHWAYS:
             from pathwaysutils.experimental import \
                 reshard as experimental_reshard

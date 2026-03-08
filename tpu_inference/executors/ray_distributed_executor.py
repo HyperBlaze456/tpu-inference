@@ -12,27 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import os
-from array import array
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import ray
 import vllm.envs as envs
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.platforms import current_platform
 from vllm.ray.ray_env import get_env_vars_to_copy
-from vllm.sequence import VLLM_TOKEN_ID_ARRAY_TYPE
 from vllm.utils.network_utils import (get_distributed_init_method, get_ip,
                                       get_open_port)
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.executor.ray_distributed_executor import \
     RayDistributedExecutor as RayDistributedExecutorV1
 from vllm.v1.executor.ray_executor import RayWorkerMetaData
-from vllm.v1.executor.ray_utils import RayWorkerWrapper, _wait_until_pg_ready
+from vllm.v1.executor.ray_utils import RayWorkerWrapper as RayWorkerWrapperV1
+from vllm.v1.executor.ray_utils import _wait_until_pg_ready
 
+from tpu_inference.distributed.jax_parallel_state import get_pp_group
 from tpu_inference.logger import init_logger
+from tpu_inference.models.jax.jax_intermediate_tensor import \
+    JaxIntermediateTensors
 
 try:
     from ray._private.state import available_resources_per_node
@@ -44,26 +46,9 @@ except ImportError:
 import asyncio
 from collections import defaultdict
 
-import msgspec
-from vllm.v1.outputs import SamplerOutput
-
 from tpu_inference.distributed.utils import set_node_kv_ip_port
 
 logger = init_logger(__name__)
-
-
-def _encode_hook(obj: Any) -> Any:
-    """Custom msgspec enc hook that supports array types and MultiModalKwargsItem.
-
-    See https://jcristharif.com/msgspec/api.html#msgspec.msgpack.Encoder
-    """
-    if isinstance(obj, array):
-        assert obj.typecode == VLLM_TOKEN_ID_ARRAY_TYPE, (
-            f"vLLM array type should use '{VLLM_TOKEN_ID_ARRAY_TYPE}' type. "
-            f"Given array has a type code of {obj.typecode}.")
-        return obj.tobytes()
-    if isinstance(obj, MultiModalKwargsItem):
-        return dict(obj)
 
 
 class RayDistributedExecutor(RayDistributedExecutorV1):
@@ -107,10 +92,6 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
 
         # Create the parallel GPU workers.
         self._init_workers_ray(placement_group)
-
-        self.input_encoder = msgspec.msgpack.Encoder(enc_hook=_encode_hook)
-        self.output_decoder = msgspec.msgpack.Decoder(
-            Optional[List[SamplerOutput]])
 
         self.pp_locks: Optional[List[asyncio.Lock]] = None
 
@@ -246,8 +227,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                 },
                 scheduling_strategy=scheduling_strategy,
                 **ray_remote_kwargs,
-            )(RayWorkerWrapper).remote(vllm_config=self.vllm_config,
-                                       rpc_rank=rank)
+            )(RayWorkerWrapper).remote(rpc_rank=rank)
             worker_metadata.append(
                 RayWorkerMetaData(worker=worker, created_rank=rank))
 
@@ -356,14 +336,36 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         distributed_init_method = get_distributed_init_method(
             driver_ip, get_open_port())
 
+        # Get the Driver's Node ID to identify local vs remote workers
+        driver_node_id = ray.get_runtime_context().get_node_id()
+
         # Initialize the actual workers inside worker wrapper.
         all_kwargs = []
         for rank, (node_id, _) in enumerate(worker_node_and_tpu_ids):
             local_rank = node_workers[node_id].index(rank)
             ip = sorted_worker_metadata[rank].ip
             prev_ip = sorted_worker_metadata[rank - 1].ip if rank > 0 else ""
+
+            worker_vllm_config = self.vllm_config
+
+            # When using object storage (e.g., RunAI), the Leader updates `model` to its local
+            # cache path (e.g., /root/.cache/...) during ModelConfig initialization
+            # (maybe_pull_model_tokenizer_for_runai), while `model_weights` preserves the original URI after the model is pulled.
+            # (Standard HF downloads do not overwrite `model`, allowing workers to pull normally).
+            # Since workers on remote nodes cannot access the Leader's filesystem, we create a
+            # worker-specific config copy and restore the original GCS URI from `model_weights`.
+            # This allows each worker to independently invoke `maybe_pull_model_tokenizer_for_runai`
+            # and stream the model from GCS.
+            if node_id != driver_node_id and getattr(
+                    self.vllm_config, "model_config", None) and getattr(
+                        self.vllm_config.model_config, "model_weights", None):
+                worker_vllm_config = copy.deepcopy(self.vllm_config)
+                worker_vllm_config.model_config.model = worker_vllm_config.model_config.model_weights
+                # Unset model_weights so maybe_pull_model_tokenizer_for_runai will pull the model.
+                worker_vllm_config.model_config.model_weights = None
+
             kwargs = dict(
-                vllm_config=self.vllm_config,
+                vllm_config=worker_vllm_config,
                 local_rank=local_rank,
                 rank=rank,
                 distributed_init_method=distributed_init_method,
@@ -372,19 +374,24 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                 ip=ip,
                 prev_worker_ip=prev_ip,
             )
+            # NOTE(Chenyaaang): Adjust worker's rank to 0 if PP=1.
+            # Otherwise if we have 4 ray nodes each with 1 chip and use TP=4,
+            # We'll have 4 workers with rank 0,1,2,3 respectively. This
+            # contradicts with get_pp_group().
+            if self.parallel_config.pipeline_parallel_size == 1:
+                kwargs["rank"] = 0
             all_kwargs.append(kwargs)
         self.collective_rpc("init_worker", args=(all_kwargs, ))
         self.collective_rpc("init_device")
         if self.parallel_config.pipeline_parallel_size > 1:
             self.collective_rpc("initialize_pp_transfer_connect")
         self.collective_rpc("load_model")
-
         if self.use_ray_spmd_worker:
             for pp_rank in range(self.parallel_config.pipeline_parallel_size):
                 self.pp_tp_workers.append([])
                 num_tp_workers = int(
-                    self.parallel_config.tensor_parallel_size //
-                    num_tpu_per_worker)
+                    len(self.workers) //
+                    self.parallel_config.pipeline_parallel_size)
                 for tp_rank in range(num_tp_workers):
                     # PP=2, TP=4, num_tpu_per_worker=2
                     # pp_tp_workers = [[0, 1], [2, 3]]
@@ -397,3 +404,20 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
     # as we pass the kv_parameters through proxy server
     def get_kv_connector_handshake_metadata(self) -> None:
         pass
+
+
+class RayWorkerWrapper(RayWorkerWrapperV1):
+    """
+    Ray worker wrapper for TPU.
+
+    The implementation is similar to vllm/v1/executor/ray_utils.py
+    
+    _is_intermediate_tensors: check whether the output is JaxIntermediateTensors.
+    _is_last_rank: check whether this Ray worker is the last PP stage.
+    """
+
+    def _is_intermediate_tensors(self, output) -> bool:
+        return isinstance(output, JaxIntermediateTensors)
+
+    def _is_last_rank(self) -> bool:
+        return get_pp_group().is_last_rank

@@ -39,8 +39,8 @@ from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                QKVParallelLinear,
                                                ReplicatedLinear,
                                                RowParallelLinear)
-from vllm.model_executor.utils import set_random_seed
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import set_random_seed
 
 from tpu_inference.layers.vllm.process_weights.cleanup_sharding import \
     _shard_module_to_tpu
@@ -630,7 +630,7 @@ def _create_lora_wrapper(linear,
                          vllm_config,
                          mesh,
                          repeats=1):
-    base_linear.weight.data = linear.weight.data
+    base_linear.weight.data = linear.weight.data.clone()
     jax_config = VllmQuantLinearConfig(vllm_config, mesh, base_linear)
     linear_method = VllmUnquantizedLinearMethod(jax_config)
     base_linear.quant_method = linear_method

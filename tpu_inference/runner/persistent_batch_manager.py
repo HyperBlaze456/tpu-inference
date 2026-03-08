@@ -141,7 +141,7 @@ class PersistentBatchManager:
                 prompt_token_ids=new_req_data.prompt_token_ids,
                 mm_features=new_req_data.mm_features,
                 sampling_params=sampling_params,
-                pooling_params=None,
+                pooling_params=new_req_data.pooling_params,
                 generator=None,
                 block_ids=new_req_data.block_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
@@ -197,7 +197,7 @@ class PersistentBatchManager:
             req_state = self.requests[req_id]
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
-            resumed_from_preemption = req_data.resumed_from_preemption[i]
+            resumed_from_preemption = req_id in req_data.resumed_req_ids
             num_output_tokens = req_data.num_output_tokens[i]
 
             # Update the cached states.

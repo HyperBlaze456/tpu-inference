@@ -18,10 +18,11 @@ import glob
 import math
 import os
 import re
+from collections import defaultdict
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 import jax
 import jax.numpy as jnp
@@ -30,10 +31,17 @@ import torchax
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
+from jax.sharding import SingleDeviceSharding, get_mesh
 from safetensors import safe_open
+from torchax.ops.mappings import t2j
 from vllm.config import VllmConfig
+from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from tpu_inference import envs, utils
+from tpu_inference.layers.common.utils import (cpu_mesh_context,
+                                               general_device_put)
+from tpu_inference.layers.jax import JaxModule
+from tpu_inference.layers.jax.quantization import QuantizeMethodBase
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.utils import file_utils
 
@@ -206,16 +214,29 @@ def get_param_and_sharding(params: nnx.State, shardings: Any,
     return plevel, slevel.value
 
 
-def shard_put(x: jax.Array, shardings, mesh: jax.sharding.Mesh) -> jax.Array:
+def shard_put(x: jax.Array,
+              shardings,
+              mesh: jax.sharding.Mesh | None = None) -> jax.Array:
     # Single device sharding requires this special handling
     # to avoid the recursive jit error.
+    if mesh is None:
+        mesh = get_mesh()
+
+    x_mesh = None
+    if isinstance(x.sharding, NamedSharding):
+        x_mesh = x.sharding.mesh
+
     if math.prod(mesh.axis_sizes) == 1:
-        return jax.device_put(x, mesh.devices.flatten()[0])
+        return general_device_put(x,
+                                  mesh.devices.flatten()[0],
+                                  source_mesh=x_mesh)
 
     if isinstance(shardings, tuple):
-        return jax.device_put(x, NamedSharding(mesh, P(*shardings)))
+        return general_device_put(x,
+                                  NamedSharding(mesh, P(*shardings)),
+                                  source_mesh=x_mesh)
     else:
-        return jax.device_put(x, shardings)
+        return general_device_put(x, shardings, source_mesh=x_mesh)
 
 
 def get_default_maps(model_config, mesh: Mesh,
@@ -293,6 +314,7 @@ def _load_and_shard_weight(vllm_config,
                            mesh: Mesh,
                            hf_key: str,
                            hf_weight: jax.Array,
+                           keep_hf_weight_suffix_when_match: list[str],
                            keep_original_dtype_keys_regex: list[str]
                            | None = None,
                            pp_missing_layers: list[str] | None = None):
@@ -327,19 +349,27 @@ def _load_and_shard_weight(vllm_config,
         )
         hf_weight = hf_weight.astype(model_config.dtype)
 
-    if hf_key.endswith(".weight"):
+    # For tensors whose name matches any string in `keep_hf_weight_suffix_when_match`, the
+    # '.weight' suffix in HF keys will be kept.
+    # Context: some models are being refactored to have identical parameter names as HF
+    # models, so the suffix does not need to be removed for those parameters. Eventually
+    # we want to get rid of the ".weight" suffix removal logic altogether.
+    # TODO(#1479): remove this argument and related logic after the refactoring is done.
+    if hf_key.endswith(".weight") and all(
+            substr not in hf_key
+            for substr in keep_hf_weight_suffix_when_match):
         hf_key = hf_key.removesuffix(".weight")
 
     # Find the corresponding model key using the HF key
     if "layers" in hf_key:
         layer_num = re.search(r"layers\.(\d+)", hf_key).group(1)
         layer_key = re.sub(r"layers\.\d+", "layers.*", hf_key)
-        model_key = name_map[layer_key]
+        model_key = name_map.get(layer_key, layer_key)
         model_key = re.sub(r"layers\.\*", f"layers.{layer_num}", model_key)
     elif "blocks" in hf_key:
         layer_num = re.search(r"blocks\.(\d+)", hf_key).group(1)
         layer_key = re.sub(r"blocks\.\d+", "blocks.*", hf_key)
-        model_key = name_map[layer_key]
+        model_key = name_map.get(layer_key, layer_key)
         model_key = re.sub(r"blocks\.\*", f"blocks.{layer_num}", model_key)
     else:
         if hf_key not in name_map and hf_key == "lm_head":
@@ -432,6 +462,7 @@ def _load_hf_weights_on_thread(
     metadata_map: "MetadataMap",
     mesh: Mesh,
     weights_file: str,
+    keep_hf_weight_suffix_when_match: list[str],
     filter_regex: Optional[str] = None,
     keep_original_dtype_keys_regex: Optional[list[str]] = None,
     pp_missing_layers: list[str] | None = None,
@@ -452,8 +483,9 @@ def _load_hf_weights_on_thread(
             mesh,
             hf_key,
             hf_weight,
-            keep_original_dtype_keys_regex,
-            pp_missing_layers,
+            keep_original_dtype_keys_regex=keep_original_dtype_keys_regex,
+            pp_missing_layers=pp_missing_layers,
+            keep_hf_weight_suffix_when_match=keep_hf_weight_suffix_when_match,
         )
 
 
@@ -466,16 +498,25 @@ def load_hf_weights(
     is_draft_model: bool = False,
     keep_original_dtype_keys_regex: Optional[list[str]] = None,
     pp_missing_layers: list[str] | None = None,
+    keep_hf_weight_suffix_when_match: list[str] = [],
 ):
-    """Load weights into a JAX model from either an iterator or files."""
+    """Load weights into a JAX model from either an iterator or files.
+
+    For tensors whose name matches any string in `keep_hf_weight_suffix_when_match`, the
+    '.weight' suffix in HF keys will be kept.
+    Some models are being refactored to have identical parameter names as HF models, so the suffix
+    does not need to be removed for those parameters. Eventually we want to get rid of
+    the ".weight" suffix removal logic altogether.
+    TODO(#1479): remove this argument and related logic after the refactoring is done.
+    """
     params = nnx.state(model)
     try:
         shardings = nnx.get_named_sharding(params, mesh)
     except TypeError:
         shardings = params
     weights_iterator = None
-    if hasattr(vllm_config.model_config, "model_weights_iterator"):
-        weights_iterator = vllm_config.model_config.model_weights_iterator
+    if hasattr(vllm_config.model_config, "runai_model_weights_iterator"):
+        weights_iterator = vllm_config.model_config.runai_model_weights_iterator
     env = torchax.default_env()
     # The weights_iterator is used in RunAI model streamer integration.
     if weights_iterator is not None:
@@ -495,8 +536,10 @@ def load_hf_weights(
                 mesh,
                 hf_key,
                 hf_weight_jax,
-                keep_original_dtype_keys_regex,
+                keep_original_dtype_keys_regex=keep_original_dtype_keys_regex,
                 pp_missing_layers=pp_missing_layers,
+                keep_hf_weight_suffix_when_match=
+                keep_hf_weight_suffix_when_match,
             )
     else:
         # File-based path (multi-threaded)
@@ -525,6 +568,8 @@ def load_hf_weights(
                     keep_original_dtype_keys_regex=
                     keep_original_dtype_keys_regex,
                     pp_missing_layers=pp_missing_layers,
+                    keep_hf_weight_suffix_when_match=
+                    keep_hf_weight_suffix_when_match,
                 ) for weights_file in weights_files
             ]
             for future in futures:
@@ -619,3 +664,219 @@ def transfer_state_with_mappings(src_state,
 
     tgt_state = tgt_state.from_flat_path(tgt_flat)
     return tgt_state
+
+
+class BaseWeightLoader:
+
+    def __init__(self, vllm_config: VllmConfig, **kwargs):
+        self.vllm_config = vllm_config
+        self.names_and_weights_generator = model_weights_generator(
+            model_name_or_path=vllm_config.model_config.model,
+            download_dir=vllm_config.load_config.download_dir,
+            **kwargs,
+        )
+
+    def get_weights_iterator(self):
+        weights_iterator = getattr(self.vllm_config.model_config,
+                                   "runai_model_weights_iterator", None)
+        if weights_iterator:
+            return weights_iterator
+        else:
+            return self.names_and_weights_generator
+
+
+class StandardWeightLoader(BaseWeightLoader):
+
+    def __init__(self, vllm_config: VllmConfig, mesh: Mesh):
+        super().__init__(vllm_config, framework="pt")
+        self.vllm_config = vllm_config
+        self.mesh = mesh
+
+    def load_weights(self,
+                     model: nnx.Module,
+                     mappings: dict | MetadataMap,
+                     keep_hf_weight_suffix_when_match: list[str] = []):
+        """
+        Calls the generic load_hf_weights utility, passing the correct
+        weights iterator.
+
+        `mappings` can be either a MetadataMap or a dict mapping, if it's
+        * a dict, the default MetadataMap will be created with get_default_maps.
+        * a MetadataMap, it will be used directly. This is useful for cases
+        where caller needs to customize the reshape/transpose/pad maps, e.g.
+        update the key of tranpose_map from "q_proj" to "q_proj.weight".
+
+        Context: some models are being refactored to have identical parameter names as HF
+        models, so these parameters keeps ".weight" suffix. Eventually
+        we want to get rid of the ".weight" suffix removal logic altogether.
+        TODO(#1479): remove this argument and related logic after the refactoring is done.
+        """
+        if isinstance(mappings, MetadataMap):
+            metadata_map = mappings
+        else:
+            metadata_map = get_default_maps(self.vllm_config.model_config,
+                                            self.mesh, mappings)
+
+        load_hf_weights(
+            vllm_config=self.vllm_config,
+            model=model,
+            metadata_map=metadata_map,
+            mesh=self.mesh,
+            pp_missing_layers=getattr(model, 'pp_missing_layers', []),
+            keep_hf_weight_suffix_when_match=keep_hf_weight_suffix_when_match)
+
+
+def jax_array_from_reshaped_torch(
+        torch_weight: torch.Tensor,
+        *,
+        reshape_dims: Optional[tuple[int, ...]] = None,
+        permute_dims: Optional[tuple[int, ...]] = None) -> jax.Array:
+    """Convert a torch.Tensor to a jax.Array with reshaping and transposing.
+
+    HuggingFace model almost always store linear layer weights with contracting dimension
+    last, and only support 1D/2D weight tensors. This function reshapes then transposes
+    the torch weight to match the jax_param shape before loading.
+
+    Args:
+        torch_weight: The source torch.Tensor weight.
+        reshape_dims: Optional tuple specifying the shape to reshape the torch weight to before permutation. If None, no reshaping is applied.
+        permute_dims: Optional tuple specifying the permutation of dimensions. If None, no-op for 1D tensors and transpose for 2D tensors is applied.
+    """
+    if reshape_dims is not None:
+        torch_weight = torch_weight.reshape(reshape_dims)
+    if permute_dims is None and torch_weight.ndim == 2:
+        permute_dims = (1, 0)
+    if permute_dims is not None:
+        torch_weight = torch_weight.permute(*permute_dims)
+
+    with cpu_mesh_context():
+        return t2j(torch_weight, use_dlpack=False)
+
+
+def load_nnx_param_from_reshaped_torch(
+        jax_param: nnx.Param,
+        torch_weight: torch.Tensor,
+        *,
+        reshape_dims: Optional[tuple[int, ...]] = None,
+        permute_dims: Optional[tuple[int, ...]] = None,
+        param_name: str = "Unknown"):
+    """Load a nnx.Param from a torch.Tensor with reshaping and transposing.
+
+    HuggingFace model almost always store linear layer weights with contracting dimension
+    last, and only support 1D/2D weight tensors. This function reshapes then transposes
+    the torch weight to match the jax_param shape before loading.
+
+    Args:
+        jax_param: The target nnx.Param to load the weight into.
+        torch_weight: The source torch.Tensor weight.
+        reshape_dims: Optional tuple specifying the shape to reshape the torch weight to before permutation. If None, no reshaping is applied.
+        permute_dims: Optional tuple specifying the permutation of dimensions. If None, no-op for 1D tensors and transpose for 2D tensors is applied.
+    """
+    jax_weight = jax_array_from_reshaped_torch(torch_weight,
+                                               reshape_dims=reshape_dims,
+                                               permute_dims=permute_dims)
+
+    assert tuple(jax_weight.shape) == jax_param.value.shape, \
+        f"Shape mismatch when loading weight '{param_name}': torch {jax_weight.shape} vs jax {jax_param.value.shape}"
+
+    spec = jax_param.get_metadata().get('sharding', ())
+    if isinstance(spec, NamedSharding):
+        spec = spec.spec
+    elif isinstance(spec, SingleDeviceSharding):
+        spec = ()
+    mesh = jax_param.get_metadata().get('mesh', None)
+
+    try:
+        jax_param.value = shard_put(jax_weight, spec, mesh=mesh)
+        jax_param.set_metadata('_is_loaded', True)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load weight '{param_name}' with shape {jax_weight.shape} into param with shape {jax_param.value.shape}"
+        ) from e
+
+
+class JaxAutoWeightsLoader(AutoWeightsLoader):
+    """A weights loader for JAX models."""
+
+    def __init__(self, model, **kwargs):
+        assert isinstance(model, JaxModule)
+
+        for name, param in model.named_parameters():
+            if not hasattr(param, "weight_loader"):
+                # Following are common patterns in standard transformers. To add pattern for modules
+                # beyond standard transformers, please consider setting weight_loader.
+                reshape_dims = None
+                permute_dims = None
+                if any(substr in name
+                       for substr in ["k_proj.weight", "v_proj.weight"]):
+                    D, N, H = param.value.shape
+                    reshape_dims = (N, H, D)
+                    permute_dims = (2, 0, 1)
+                if any(substr in name for substr in ["q_proj.weight"]):
+                    if envs.LAYOUT_Q_PROJ_AS_NDH:
+                        N, D, H = param.value.shape
+                        reshape_dims = (N, H, D)
+                        permute_dims = (0, 2, 1)
+                    else:
+                        D, N, H = param.value.shape
+                        reshape_dims = (N, H, D)
+                        permute_dims = (2, 0, 1)
+                elif any(substr in name for substr in
+                         ["q_proj.bias", "k_proj.bias", "v_proj.bias"]):
+                    N, H = param.value.shape
+                    reshape_dims = (N, H)
+                    permute_dims = (0, 1)
+                elif "o_proj.weight" in name:
+                    N, H, D = param.value.shape
+                    reshape_dims = (D, N, H)
+                    permute_dims = (1, 2, 0)
+                elif "embed_tokens.weight" in name:
+                    permute_dims = (0, 1)
+                elif "lm_head" in name:
+                    permute_dims = (1, 0)
+
+                param.set_metadata(
+                    "weight_loader",
+                    functools.partial(load_nnx_param_from_reshaped_torch,
+                                      reshape_dims=reshape_dims,
+                                      permute_dims=permute_dims,
+                                      param_name=name))
+
+        super().__init__(model, **kwargs)
+        # Book mark those already done processing, skip if visited.
+        self._process_weights_after_loading_per_module = defaultdict(
+            lambda: False)
+
+    def _load_module(self, base_prefix: str, module: JaxModule,
+                     weights: Iterable) -> Iterable:
+        yield from super()._load_module(base_prefix, module, weights)
+        # Post-process module after loading weights. Unlike vLLM post-process
+        # weights after loading all weights, we do it per-module here to
+        # avoid OOM.
+        if self._process_weights_after_loading_per_module[base_prefix]:
+            return
+        if (quant_method := getattr(module, 'quant_method', None)) is not None:
+            assert isinstance(quant_method, QuantizeMethodBase)
+            loaded = quant_method.process_weights_after_loading(module)
+            assert isinstance(loaded, bool)
+            self._process_weights_after_loading_per_module[
+                base_prefix] = loaded
+
+
+class LoadableWithIterator:
+    """Mixin for models that support loading weights with an iterator.
+
+    This is replicating what vLLM does for most models, e.g. https://github.com/vllm-project/vllm/blob/8e2a469b3b2f67bc900ed72724fe3f05e3564994/vllm/model_executor/models/gemma3_mm.py#L644-L646
+    """
+
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
+        if not isinstance(weights, Iterable):
+            # Use next parent class in MRO.
+            return super().load_weights(weights)
+
+        loader = JaxAutoWeightsLoader(
+            self,
+            skip_prefixes=(["lm_head"]
+                           if not hasattr(self, 'lm_head') else None))
+        return loader.load_weights(weights)

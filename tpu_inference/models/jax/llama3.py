@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import Mesh
-from transformers import LlamaConfig, modeling_flax_utils
+from transformers import LlamaConfig
 from vllm.config import VllmConfig
 
 from tpu_inference import utils
@@ -28,18 +28,19 @@ from tpu_inference.layers.common.attention_interface import attention
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.quantization import quantize_kv
 from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.jax.layers import FlaxUtils
 from tpu_inference.layers.jax.pp_utils import PPMissingLayer, make_layers
 from tpu_inference.layers.jax.rope_interface import apply_rope
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
-from tpu_inference.models.jax.utils.weight_utils import (get_default_maps,
-                                                         load_hf_weights)
+from tpu_inference.models.jax.utils.weight_utils import StandardWeightLoader
 from tpu_inference.utils import get_mesh_shape_product
 
 logger = init_logger(__name__)
 
 init_fn = nnx.initializers.uniform()
+modeling_flax_utils = FlaxUtils()
 
 
 class LlamaMLP(nnx.Module):
@@ -275,7 +276,7 @@ class LlamaModel(nnx.Module):
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             hf_config.num_hidden_layers,
-            lambda: LlamaDecoderLayer(
+            lambda _: LlamaDecoderLayer(
                 config=hf_config,
                 dtype=dtype,
                 rng=rng,
@@ -348,6 +349,7 @@ class LlamaModel(nnx.Module):
 
 
 class LlamaForCausalLM(nnx.Module):
+    WeightLoader = StandardWeightLoader
 
     def __init__(self, vllm_config: VllmConfig, rng_key: jax.Array,
                  mesh: Mesh) -> None:
@@ -430,10 +432,5 @@ class LlamaForCausalLM(nnx.Module):
                 "lm_head": "model.lm_head",
             })
 
-        metadata_map = get_default_maps(self.vllm_config.model_config,
-                                        self.mesh, mappings)
-        load_hf_weights(vllm_config=self.vllm_config,
-                        model=self,
-                        metadata_map=metadata_map,
-                        mesh=self.mesh,
-                        pp_missing_layers=self.pp_missing_layers)
+        loader = self.WeightLoader(self.vllm_config, self.mesh)
+        loader.load_weights(self, mappings)

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import math
 import os
 import tempfile
 from dataclasses import dataclass, field
@@ -8,31 +9,27 @@ from typing import Callable, Dict, Optional, Tuple
 import jax
 import jaxlib
 import jaxtyping
-import vllm.envs as vllm_envs
 from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.distributed import get_pp_group
 from vllm.distributed.kv_transfer import (ensure_kv_transfer_initialized,
                                           has_kv_transfer_group)
 from vllm.distributed.parallel_state import (ensure_model_parallel_initialized,
                                              init_distributed_environment)
-from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
 from vllm.v1 import utils as vllm_utils
-from vllm.v1.core.kv_cache_utils import (get_kv_cache_groups, get_num_blocks,
-                                         get_uniform_page_size)
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.worker.worker_base import WorkerBase
 
 from tpu_inference import envs, utils
 from tpu_inference.distributed import jax_parallel_state
+from tpu_inference.distributed.jax_parallel_state import get_pp_group
 from tpu_inference.distributed.utils import (get_device_topology_order_id,
                                              get_host_ip, get_kv_transfer_port)
 from tpu_inference.layers.common.sharding import ShardingConfigManager
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
-from tpu_inference.runner.kv_cache import get_attention_page_size_bytes
 from tpu_inference.runner.tpu_runner import TPUModelRunner
 
 logger = init_logger(__name__)
@@ -40,6 +37,7 @@ logger = init_logger(__name__)
 
 @dataclass
 class PPConfig:
+    vllm_config: VllmConfig
     rank: int
     ip: str
     prev_worker_ip: str
@@ -53,12 +51,41 @@ class PPConfig:
     default_tpu_visible_chips: str = field(init=False)
 
     def __post_init__(self):
-        self.default_tpu_process_bounds = f"1,{self.pp_world_size},1"
+        # In the isolated stage architecture, each pipeline stage operates
+        # as an independent JAX cluster.
+        # For single-host PP or multi-host with one host per stage,
+        # the cluster size for each stage is 1.
+
+        # Defines the 3D topology of the JAX processes (nodes) in the cluster. Syntax: "a,b,c"
+        self.default_tpu_process_bounds = "1,1,1"
+        # Defines how many physical TPU chips are allocated to each JAX process. Syntax: "a,b,c"
         self.default_tpu_chips_per_process_bounds = "1,1,1"
+        # Specifies the physical IDs of the TPU chips that this specific process is allowed to see and use. Syntax: comma separated ints like "a", "a,b"
         self.default_tpu_visible_chips = f"{self.rank}"
 
+        if self.pp_world_size > 1:
+            # We need to know if we are on a 2-core-per-chip (v7) or 1-core-per-chip (v6) system
+            from tpu_inference import tpu_info
+            cores_per_chip = tpu_info.get_num_cores_per_chip()
 
-class TPUWorker:
+            # This tells us how many logical JAX devices (cores) this specific pipeline stage needs. If you are doing Tensor Parallelism (TP) within a stage, total_devices would be the TP size.
+            sharding_config: ShardingConfigManager = self.vllm_config.sharding_config
+            total_cores_per_stage = sharding_config.total_devices
+
+            # Number of physical chips needed for this stage.
+            chips_per_stage = math.ceil(total_cores_per_stage / cores_per_chip)
+
+            if chips_per_stage > 0:
+                start_chip = self.rank * chips_per_stage
+                self.default_tpu_visible_chips = ",".join(
+                    str(i)
+                    for i in range(start_chip, start_chip + chips_per_stage))
+
+                # Set bounds to match the visible chips exactly.
+                self.default_tpu_chips_per_process_bounds = f"1,{chips_per_stage},1"
+
+
+class TPUWorker(WorkerBase):
 
     def __init__(
         self,
@@ -71,43 +98,46 @@ class TPUWorker:
         ip: str = "localhost",
         prev_worker_ip: str = "localhost",
     ):
-        self.vllm_config = vllm_config
-        self.model_config = vllm_config.model_config
-        self.parallel_config = vllm_config.parallel_config
-        self.cache_config = vllm_config.cache_config
-        self.local_rank = local_rank
-        self.rank = rank
-        self.distributed_init_method = distributed_init_method
-        self.is_driver_worker = is_driver_worker
+        super().__init__(
+            vllm_config,
+            local_rank,
+            rank,
+            distributed_init_method,
+            is_driver_worker=is_driver_worker,
+        )
+
         self.devices = devices if devices is not None else []
         self.device_ranks = set(device.id for device in self.devices
                                 if isinstance(device, jaxlib._jax.Device))
-        self.pp_config = PPConfig(rank, ip, prev_worker_ip,
+        self.pp_config = PPConfig(vllm_config, rank, ip, prev_worker_ip,
                                   self.parallel_config.pipeline_parallel_size)
 
-        if self.model_config.trust_remote_code:
-            # note: lazy import to avoid importing torch before initializing
-            from vllm.utils.import_utils import init_cached_hf_modules
-
-            init_cached_hf_modules()
+        # Explicitly trigger RunAI download on the worker if needed.
+        # This handles downloading config.json and other non-weight files to the
+        # worker's local cache before VllmModelWrapper initialization.
+        if hasattr(self.model_config, "maybe_pull_model_tokenizer_for_runai"):
+            self.model_config.maybe_pull_model_tokenizer_for_runai(
+                self.model_config.model, self.model_config.tokenizer)
 
         # Delay profiler initialization to the start of the profiling.
         # This is because in vLLM V1, MP runtime is initialized before the
         # TPU Worker is initialized. The profiler server needs to start after
         # MP runtime is initialized.
         self.profile_dir = None
-        if vllm_envs.VLLM_TORCH_PROFILER_DIR and self.rank < 1 and self.pp_config.pp_world_size == 1:
+        self.vllm_config.profiler_config
+        profiler_config = self.vllm_config.profiler_config
+        if profiler_config.profiler == "torch" and self.rank < 1 and self.pp_config.pp_world_size == 1:
             if not self.devices or 0 in self.device_ranks:
                 # For TPU, we can only have 1 active profiler session for 1 profiler
                 # server. So we only profile on rank0.
-                self.profile_dir = vllm_envs.VLLM_TORCH_PROFILER_DIR
+                self.profile_dir = profiler_config.torch_profiler_dir
                 logger.info("Profiling enabled. Traces will be saved to: %s",
                             self.profile_dir)
 
         # For PP, we use MPMD so we want to profile every worker.
-        if self.pp_config.pp_world_size > 1 and vllm_envs.VLLM_TORCH_PROFILER_DIR:
+        if self.pp_config.pp_world_size > 1 and profiler_config.profiler == "torch":
             self.profile_dir = os.path.join(
-                vllm_envs.VLLM_TORCH_PROFILER_DIR,
+                profiler_config.torch_profiler_dir,
                 f"pprank_{self.rank}_ppworldsize_{self.pp_config.pp_world_size}"
             )
             os.makedirs(self.profile_dir, exist_ok=True)
@@ -311,7 +341,7 @@ class TPUWorker:
                 scheduler_output, self.rank - 1, self.step_counter)
             # TODO: this method might only works for vllm model, not sure about jax models.
             tensor_spec = self.model_runner.get_intermediate_tensor_spec(
-                scheduler_output.total_num_scheduled_tokens)
+                scheduler_output)
             intermediate_tensors_dict = get_pp_group().recv_tensor_dict(
                 uuid, tensor_spec)
             intermediate_tensors = JaxIntermediateTensors(
@@ -344,14 +374,9 @@ class TPUWorker:
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
         return self.model_runner.take_draft_token_ids()
 
-    def add_lora(
-        self,
-        lora_request: LoRARequest,
-    ) -> bool:
-        raise NotImplementedError(
-            "LoRA is not supported by the JAX worker yet.")
-
-    def profile(self, is_start: bool = True):
+    def profile(self,
+                is_start: bool = True,
+                profile_prefix: str | None = None):
         if is_start:
             options = jax.profiler.ProfileOptions()
             # default: https://docs.jax.dev/en/latest/profiling.html#general-options
@@ -365,14 +390,12 @@ class TPUWorker:
     def load_model(self) -> None:
         self.model_runner.load_model()
 
-    def compile_or_warm_up_model(self) -> None:
+    def compile_or_warm_up_model(self) -> float:
         self.model_runner.capture_model()
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         self.model_runner._init_random()
-
-    def reset_mm_cache(self) -> None:
-        pass
+        return self.compilation_config.compilation_time
 
     def get_model(self):
         return self.model_runner.get_model()
@@ -393,37 +416,7 @@ class TPUWorker:
         # responsible for this translation. When vLLM can be modified, this
         # method should be changed to return `dict[str, AbstractKVCacheSpec]`,
         # and the vLLM side should be updated to handle the translation.
-        kv_cache_spec = self.model_runner.get_kv_cache_spec()
-
-        if len(kv_cache_spec) == 0:
-            return kv_cache_spec
-
-        # TODO(kyuyeunk): Instead of checking page_size_bytes here, introduce
-        # feature that allows overriding page_size_bytes of KVCacheSpec.
-        vllm_page_size_bytes = get_uniform_page_size(
-            list(kv_cache_spec.values()))
-        attention_page_size_bytes = get_attention_page_size_bytes(
-            self.model_runner.mesh, kv_cache_spec)
-
-        if vllm_page_size_bytes != attention_page_size_bytes:
-            logger.info(
-                f"Page size calculated by vLLM ({vllm_page_size_bytes} Bytes) "
-                f"does not match with actual page size used by the kernel "
-                f"({attention_page_size_bytes} Bytes). Recalculating number of "
-                f"KV blocks using actual page size.")
-
-            kv_cache_groups = get_kv_cache_groups(self.vllm_config,
-                                                  kv_cache_spec)
-            group_size = max(
-                len(group.layer_names) for group in kv_cache_groups)
-            available_memory = self.determine_available_memory()
-            num_blocks = get_num_blocks(self.vllm_config, group_size,
-                                        available_memory,
-                                        attention_page_size_bytes)
-            cache_config = self.vllm_config.cache_config
-            cache_config.num_gpu_blocks_override = num_blocks
-
-        return kv_cache_spec
+        return self.model_runner.get_kv_cache_spec()
 
     def initialize_from_config(
         self,
@@ -444,10 +437,6 @@ class TPUWorker:
         port = get_kv_transfer_port()
         return (int(self.topology_order_id), ip, int(port))
 
-    def check_health(self) -> None:
-        # worker will always be healthy as long as it's running.
-        return
-
     def sync_weights(
         self,
         updated_weights: jaxtyping.PyTree,
@@ -462,8 +451,11 @@ class TPUWorker:
                                                transpose_keys=transpose_keys,
                                                reshard_fn=reshard_fn)
 
-    def shutdown(self) -> None:
-        return
+    def delete_kv_cache(self) -> None:
+        self.model_runner.delete_kv_cache()
+
+    def reinitialize_kv_cache(self) -> None:
+        self.model_runner.reinitialize_kv_cache()
 
     # Ray executor do not need handshake metadata
     # as we pass the kv_parameters through proxy server

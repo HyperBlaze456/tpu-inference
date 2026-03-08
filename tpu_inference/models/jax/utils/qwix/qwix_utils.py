@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import copy
 import functools
 import os
 from typing import TYPE_CHECKING, Callable, List
@@ -30,56 +29,10 @@ from tpu_inference.utils import device_array
 logger = init_logger(__name__)
 
 QUANTIZATION_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "configs")
-DEFAULT_NUM_BLOCKS_FOR_JIT_KV_CACHE = 2000
+DEFAULT_NUM_BLOCKS_FOR_JIT_KV_CACHE = 2048
 DEFAULT_NUM_TOKENS_FOR_MODEL_INPUTS = 512
 DEFAULT_MAX_NUM_SEQS_FOR_MODEL_INPUTS = 256
 DEFAULT_MAX_NUM_BLOCKS_PER_REQ = 16
-
-DEFAULT_DEEPSEEK_FP4_MLP_MOE_FP8_ATTN_CONFIG = {
-    "qwix": {
-        "use_abstract_model":
-        True,
-        "scale_dtype":
-        "bfloat16",
-        "rules": [
-            # Exclude router from quantization
-            {
-                "module_path": ".*.custom_module.router.*",
-                "weight_qtype": None,
-            },
-            # Avoid the combine expert ops
-            {
-                "module_path": ".*combine_experts.*",
-                "weight_qtype": None,
-            },
-            # Attention layers: keep FP8 for weights and activations
-            {
-                "module_path": ".*.attn.*",
-                "weight_qtype": "float8_e4m3fn",
-                "act_qtype": "float8_e4m3fn",
-            },
-            # MoE experts: use FP4 for expert weights
-            {
-                "module_path": ".*.custom_module.*",
-                "weight_qtype": "float4_e2m1fn",
-                "act_qtype": "float8_e4m3fn",
-                "tile_size": 256,
-            },
-            # Shared experts: also FP4
-            {
-                "module_path": ".*.shared_experts.*",
-                "weight_qtype": "float4_e2m1fn",
-                "act_qtype": "float8_e4m3fn",
-                "tile_size": 256,
-            },
-            {
-                "module_path": ".*",
-                "weight_qtype": "float8_e4m3fn",
-                "act_qtype": "float8_e4m3fn",
-            },
-        ],
-    }
-}
 
 DEFAULT_LLAMA4_FP8_CONFIG = {
     "qwix": {
@@ -298,11 +251,7 @@ def apply_qwix_quantization(
 
     Note that we currently support different methods for applying Qwix quantization.  The typical
     approach is to apply quantization on the concrete model, which already has the weights
-    loaded in.  However, for models like DeepSeek, which are already quantized, we need to
-    first create the abstract model, then apply Qwix quantization to the abstract model, and
-    finally load the weights in.  To use the latter approach, you will need to modify the
-    model weight loading code appropriately (see deepseek_v3.py for an example) and
-    pass and `use_abstract_model=True` in the quantization config.
+    loaded in.
 
     Args:
         vllm_config: the base VLLM config
@@ -310,9 +259,9 @@ def apply_qwix_quantization(
             (e.g. _create_abstract_model).  Otherwise, this will be the concrete model (nnx.Module).
         rng: JAX RNG
         mesh: model Mesh
-        apply_to_abstract_model: if True, we will apply Qwix quantization to the abstract model, which
-            assumes that, during weight loading, the caller will thus override the QArray weights
-            (see deepseek_v3.py for an example).  Otherwise, we will will apply Qwix quantization to the
+        apply_to_abstract_model: (Deprecated) if True, we will apply Qwix quantization to the abstract model,
+            which assumes that, during weight loading, the caller will thus override the QArray weights.
+            Otherwise, we will will apply Qwix quantization to the
             concrete model, which already has the weights loaded in.
 
     Returns:
@@ -348,7 +297,7 @@ def apply_qwix_quantization(
             qwix_quantize_nnx_model, qwix_config=qwix_config)
         # NOTE: it's REALLY important `qwix_quantize_nnx_model_with_config` is jitted
         # or else you'll run into hanging
-        model_or_model_fn = nnx.jit(
+        model_or_model_fn = jax.jit(
             qwix_quantize_nnx_model_with_config,
             donate_argnums=(0, ),
             static_argnames=(
@@ -402,9 +351,6 @@ def apply_qwix_quantization(
         Helper function to create and quantize the abstract model.
         """
         model = model_or_model_fn()
-        # Handle the DeepSeek case, where this needs to be called in the abstract model
-        if hasattr(model, 'initialize_cache'):
-            model.initialize_cache()
         return qwix_quantize_fn_for_eval(model=model, rng=rng)
 
     return create_and_quantize_model_factory
@@ -412,7 +358,7 @@ def apply_qwix_quantization(
 
 def apply_qwix_on_abstract_model(vllm_config: "VllmConfig") -> bool:
     """
-    Determines whether to apply Qwix quantization on the abstract model (e.g. for DeepSeek)
+    Determines whether to apply Qwix quantization on the abstract model
     or the concrete model.  See `apply_qwix_quantization` for more details on the differences
     between these two approaches.
     Args:
@@ -449,37 +395,7 @@ def get_default_qwix_quantization_config(
         hf_config, "quantization_config") else None
     # TODO (jacobplatin): remove this so that we can support various quantization types + make
     # more flexible
-    # NOTE (jacobplatin): we'll default to mixed FP8 (attention) + FP4 (MoE experts)
-    # for DeepSeek
-    if model_type == "deepseek_v3" and quant_method == "fp8":
-        config = copy.deepcopy(DEFAULT_DEEPSEEK_FP4_MLP_MOE_FP8_ATTN_CONFIG)
-
-        # Dynamically fetch block size from HF config if available
-        # Config fmt: 'weight_block_size': [1, 512] -> we want the 2nd dim for tile_size
-        # NOTE: if the checkpoint is not 1D subchannel, we will throw an error
-        hf_quant_config = hf_config.quantization_config
-        assert "weight_block_size" in hf_quant_config, "Expected weight_block_size in quantization_config"
-        block_size = hf_quant_config["weight_block_size"]
-        if isinstance(block_size, (list, tuple)) and len(block_size) == 2:
-            assert block_size[
-                0] == 1, f"Expected first dimension to be 1 (unchanneled), but got {block_size[0]}! If you are trying to run quantized DeepSeek, we currently only support 1D-subchannel quantization and those models can be found here: https://huggingface.co/collections/jrplatin/deepseek-r1-1d-subchannel"
-            tile_size = block_size[1]
-            assert tile_size > 1, f"Expected tile_size > 1 for DeepSeek, but got {tile_size}"
-            logger.info(
-                f"Detected DeepSeek tile_size from config: {tile_size}")
-
-            # Update tile_size in the rules, since we might not always use a 1D subchannel size of
-            # 256
-            for rule in config["qwix"]["rules"]:
-                if "tile_size" in rule:
-                    rule["tile_size"] = tile_size
-        else:
-            raise ValueError(
-                f"Invalid weight_block_size config: {block_size}, expected a list/tuple of length 2"
-            )
-
-        return config
-    elif model_type == "llama4" and quant_method == "compressed-tensors":
+    if model_type == "llama4" and quant_method == "compressed-tensors":
         return DEFAULT_LLAMA4_FP8_CONFIG
     # MXFP4 (GPT-OSS): provide a default configuration to quantize MoE experts via Qwix
     elif model_type == "gpt_oss" and quant_method == "mxfp4":
@@ -570,8 +486,10 @@ def get_random_sharded_array(key: PRNGKey, mesh: Mesh, param: nnx.Param,
         return weight[index]
 
     try:
+        # new flax version use eager sharding which makes param.sharding a NamedSharding rather than a PartitionSpec
         sharded_array = jax.make_array_from_callback(
-            param_shape, NamedSharding(mesh, P(*param.sharding)), get_slice)
+            param_shape, NamedSharding(mesh, P(*param.sharding.spec)),
+            get_slice)
     except (ValueError, TypeError):
         logger.warning(
             f"Could not create sharded scale for {param_name} with shape {param_shape} and sharding {param.sharding}, skipping sharding..."
@@ -619,8 +537,8 @@ def load_random_weights_into_qwix_abstract_model(rng: PRNGKey,
         param_dtype = scale_dtype if is_qwix_scale else param.value.dtype
         param_shape = param.value.shape
         if is_qwix_scale:
-            key = f"{path[2]}.{path[3]}"
-
+            # structure of path is ('layers', NUM_NUM, RELEVANT_MODULE_NAME, .... , RELEVANT_MODULE_NAME, 'scale', 'array')
+            key = ".".join(path[2:-2])
             if key in scale_shape_map:
                 param_shape = scale_shape_map[key]
             else:
@@ -630,14 +548,11 @@ def load_random_weights_into_qwix_abstract_model(rng: PRNGKey,
             rng, mesh, param, param_shape, param_dtype,
             ".".join([str(x) for x in path]))
 
-    # Handles the DeepSeek case, where this needs to be called to make the cache weights
-    # concrete
-    if hasattr(model, 'initialize_cache'):
-        model.initialize_cache()
     logger.info("Done initializing Qwix-quantized model with random weights")
 
 
-def manually_quantize_qwix_weight(weight: jax.Array, qtype: jnp.dtype,
+def manually_quantize_qwix_weight(name: str, weight: jax.Array,
+                                  qtype: jnp.dtype,
                                   channelwise_axes: List[int],
                                   tiled_axes: dict,
                                   calibration_method: str) -> QArray:
@@ -652,7 +567,7 @@ def manually_quantize_qwix_weight(weight: jax.Array, qtype: jnp.dtype,
         tiled_axes=tiled_axes,
         calibration_method=calibration_method)
 
-    return ptq.create_quantized_param(weight, how_to_quantize)
+    return ptq.create_quantized_param(name, weight, how_to_quantize)
 
 
 def manually_quantize_qwix_activation(inputs: jax.Array, rule_name: str,
