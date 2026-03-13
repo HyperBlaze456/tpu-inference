@@ -12,9 +12,9 @@ RUN_MULTIHOST_SCRIPT="${TOP_DIR}/.buildkite/scripts/run_multihost.sh"
 
 # Auto-update the codebase before running the benchmark
 echo "--- Updating codebase..."
-# pushd "$TOP_DIR" > /dev/null
-# git pull origin main || echo "Warning: Failed to pull latest changes. Continuing with current codebase."
-# popd > /dev/null
+pushd "$TOP_DIR" > /dev/null
+git pull origin main || echo "Warning: Failed to pull latest changes. Continuing with current codebase."
+popd > /dev/null
 
 # Ensure essential environment variables are set for Spanner reporting
 export GCP_PROJECT_ID="${GCP_PROJECT_ID:-cloud-tpu-inference-test}"
@@ -229,6 +229,15 @@ Model=${MODEL_NAME}
 JobReference=${JOB_REFERENCE}
 EOF
 
+fi
+
+# Upload vllm_serve.log to GCS
+LOG_GCS_URI="gs://tpu-commons-ci/logs/${MODEL_NAME}_${INPUT_LEN}_${OUTPUT_LEN}_${JOB_REFERENCE}_vllm_serve.log"
+if [ -f "/tmp/vllm_serve.log" ]; then
+  echo "Uploading vllm_serve.log to $LOG_GCS_URI"
+  gsutil cp /tmp/vllm_serve.log "$LOG_GCS_URI" || echo "Warning: Failed to upload vllm_serve.log"
+else
+  echo "Warning: /tmp/vllm_serve.log not found, skipping upload."
 fi
 
 if [[ "${SKIP_DB_UPLOAD}" == "true" ]]; then
